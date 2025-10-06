@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Dual-teacher distillation (RSAGE + meta-path teacher) for graph-free MLP student.
 
 This script trains the relation-aware RSAGE teacher, a meta-path aware HAN-style teacher,
@@ -22,7 +22,7 @@ import random
 import argparse
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Set
 
 import numpy as np
 import torch
@@ -474,241 +474,267 @@ class RSAGE_Hetero(nn.Module):
 # =========================
 
 class MetaPathTeacher(nn.Module):
-    def __init__(self,
-                 node_dims: Dict[str, int],
-                 category: str,
-                 metapaths: List[List[Tuple[str, str, str]]],
-                 ops_template: Dict[str, Dict[str, List[SparseTensor]]],
-                 d_hid: int,
-                 num_classes: int,
-                 semantic_hidden: int = 128,
-                 dropout: float = 0.5):
-        super().__init__()
-        self.category = category
-        self.metapath_keys = [metapath_to_str(mp) for mp in metapaths]
-        self.metapaths = {metapath_to_str(mp): mp for mp in metapaths}
-        self.ops_template = ops_template
+    """HAN-based meta-path teacher with cached AddMetaPaths graph.
 
-        self.node_proj = nn.ModuleDict({nt: nn.Linear(node_dims[nt], d_hid, bias=False)
-                                        for nt in node_dims})
-        self.metapath_transform = nn.ModuleDict({key: nn.Linear(d_hid, d_hid, bias=False)
-                                                 for key in self.metapath_keys})
-        self.semantic_head = SemanticHead(d_hid, hidden=semantic_hidden)
-        self.tail_align = nn.Linear(node_dims[category], d_hid, bias=False)
-        self.delta_projector = nn.Linear(d_hid, d_hid, bias=False)
-        self.delta_projector_student = nn.Linear(d_hid, d_hid, bias=False)
-        self.classifier = nn.Linear(d_hid, num_classes)
-        self.dropout = nn.Dropout(dropout)
-        self.activation = nn.PReLU()
-
-    def forward(self, hetero: HeteroData):
-        logits, *_ = self.forward_with_details(hetero)
-        return logits
-
-    def forward_with_details(self, hetero: HeteroData,
-                             device: Optional[torch.device] = None):
-        device = device or next(self.parameters()).device
-        x_dict = {nt: hetero[nt].x.to(device) for nt in hetero.node_types}
-        tail_baseline = self.tail_align(x_dict[self.category])
-
-        mp_outputs: Dict[str, torch.Tensor] = {}
-        alpha_maps: Dict[str, SparseTensor] = {}
-        stacked_list: List[torch.Tensor] = []
-        for key in self.metapath_keys:
-            mp = self.metapaths[key]
-            ops_info = self.ops_template[key]
-            z = self.node_proj[mp[0][0]](x_dict[mp[0][0]])
-            for op in ops_info['norm_ops']:
-                z = op.to(device).matmul(z)
-                z = self.activation(z)
-            z = self.metapath_transform[key](z)
-            mp_outputs[key] = z
-            stacked_list.append(z)
-            alpha_maps[key] = ops_info['chain'].to(device)
-
-        if len(stacked_list) == 0:
-            raise ValueError("MetaPathTeacher requires at least one meta-path")
-
-        stacked = torch.stack(stacked_list, dim=1)
-        beta = self.semantic_head([mp_outputs[key] for key in self.metapath_keys])
-        fused = (beta.unsqueeze(-1) * stacked).sum(dim=1)
-        logits = self.classifier(self.dropout(fused))
-        return logits, mp_outputs, beta, alpha_maps, tail_baseline
-
-    def project_teacher_delta(self, delta: torch.Tensor) -> torch.Tensor:
-        return self.delta_projector(delta)
-
-    def project_student_delta(self, delta: torch.Tensor) -> torch.Tensor:
-        return self.delta_projector_student(delta)
-
-'''class MetaPathTeacher(nn.Module):
+    This module mirrors the standalone HAN examples (`han_dblp.py`, `han_imdb.py`).
+    We materialize the meta-path-induced graph once on the CPU, instantiate a
+    HANConv stack on top of it, and simply refresh node features from the input
+    `HeteroData` on every forward. This avoids repeatedly running the transform
+    at train time (which was both slow and numerically brittle) while keeping
+    the KD-facing API identical to the legacy teacher.
     """
-    HAN-based meta-path teacher with the same public API as the old fixed-operator teacher.
-    - Uses AddMetaPaths to materialize each meta-path as a (src,dst) meta-edge type
-    - Two HANConv layers (+ ELU + Dropout) -> linear classifier
-    - forward_with_details returns (logits, mp_outputs, beta, alpha_maps, tail_baseline)
-      to keep KD code unchanged
-    - project_teacher_delta / project_student_delta kept for KD
-    """
-    def __init__(self,
-                 node_dims: Dict[str, int],
-                 category: str,
-                 metapaths: List[List[Tuple[str, str, str]]],
-                 ops_template: Dict[str, Dict[str, List[SparseTensor]]],
-                 d_hid: int,
-                 num_classes: int,
-                 semantic_hidden: int = 128,   # kept for interface compatibility (unused)
-                 dropout: float = 0.5,
-                 heads: int = 8,
-                 drop_orig_edge_types: bool = True,
-                 drop_unconnected_node_types: bool = True):
+
+    def __init__(
+        self,
+        node_dims: Dict[str, int],
+        category: str,
+        metapaths: List[List[Tuple[str, str, str]]],
+        ops_template: Dict[str, Dict[str, List[SparseTensor]]],
+        d_hid: int,
+        num_classes: int,
+        semantic_hidden: int = 128,  # kept for interface compatibility (unused)
+        dropout: float = 0.6,
+        heads: int = 8,
+        drop_orig_edge_types: bool = True,
+        drop_unconnected_node_types: bool = True,
+    ) -> None:
         super().__init__()
         self.category = category
         self.node_dims = dict(node_dims)
         self.metapath_keys = [metapath_to_str(mp) for mp in metapaths]
         self.metapaths = {metapath_to_str(mp): mp for mp in metapaths}
-        self.ops_template = ops_template  # still used to compute mp_outputs for KD
+        self.ops_template = ops_template
 
         self.d_hid = int(d_hid)
         self.num_classes = int(num_classes)
         self.dropout_p = float(dropout)
         self.heads = int(heads)
 
-        # For KD: align tail (category raw features) into hidden space
-        self.tail_align = nn.Linear(self.node_dims[category], d_hid, bias=False)
-        self.delta_projector = nn.Linear(d_hid, d_hid, bias=False)
-        self.delta_projector_student = nn.Linear(d_hid, d_hid, bias=False)
+        self.tail_align = nn.Linear(self.node_dims[category], self.d_hid, bias=False)
+        self.delta_projector = nn.Linear(self.d_hid, self.d_hid, bias=False)
+        self.delta_projector_student = nn.Linear(self.d_hid, self.d_hid, bias=False)
 
-        # Classifier after HANConv stack
         self.lin = nn.Linear(self.d_hid, self.num_classes)
         self.act = nn.ELU()
         self.dropout = nn.Dropout(self.dropout_p)
 
-        # Node-type specific input projection for HANConv (as in PyG HANConv)
-        # We pass these via HANConv(in_channels=dict) lazily after transform.
-        self._han1: Optional[HANConv] = None
-        self._han2: Optional[HANConv] = None
+        self.node_proj = nn.ModuleDict(
+            {nt: nn.Linear(self.node_dims[nt], self.d_hid, bias=False) for nt in self.node_dims}
+        )
 
-        # Transform: convert each meta-path [(s,r,d), ...] -> [(s,d), ...]
         self._mp_pairs: List[List[Tuple[str, str]]] = [
             [(s, d) for (s, _r, d) in mp] for mp in metapaths
         ]
-        self._transform = T.AddMetaPaths(
-            metapaths=self._mp_pairs,
-            drop_orig_edge_types=drop_orig_edge_types,
-            drop_unconnected_node_types=drop_unconnected_node_types,
-        )
+        # 将长度为1的元路径与长度>=2的元路径分开处理
+        self._mp_pairs_long: List[List[Tuple[str, str]]] = [p for p in self._mp_pairs if len(p) >= 2]
+        self._mp_pairs_single: List[List[Tuple[str, str]]] = [p for p in self._mp_pairs if len(p) == 1]
+        # 记录单跳元路径对应的typed三元组（用于后续手动添加）
+        self._single_typed: List[List[Tuple[str, str, str]]] = [
+            self.metapaths[key] for key in self.metapath_keys if len(self.metapaths[key]) == 1
+        ]
 
-        # For mp_outputs (KD), we need per-node projections like before:
-        self.node_proj = nn.ModuleDict({nt: nn.Linear(self.node_dims[nt], d_hid, bias=False)
-                                        for nt in self.node_dims})
+        self._drop_orig_edge_types = bool(drop_orig_edge_types)
+        self._drop_unconnected_node_types = bool(drop_unconnected_node_types)
 
-        # For clarity/debug
-        self._built = False
+        self._meta_transform = None
+        if len(self._mp_pairs_long) > 0:
+            self._meta_transform = T.AddMetaPaths(
+                metapaths=self._mp_pairs_long,
+                drop_orig_edge_types=self._drop_orig_edge_types,
+                drop_unconnected_node_types=self._drop_unconnected_node_types,
+            )
 
-    def _maybe_build(self, data: HeteroData):
-        if self._built:
+        self.han_conv1: Optional[HANConv] = None
+        self.han_conv2: Optional[HANConv] = None
+
+        self._meta_graph_cpu: Optional[HeteroData] = None
+        self._meta_metadata: Optional[Tuple[List[str], List[Tuple[str, str, str]]]] = None
+
+    # ------------------------------------------------------------------
+    # Meta-graph construction helpers
+    # ------------------------------------------------------------------
+    def _ensure_required_pairs(self, data: HeteroData) -> None:
+        required: Set[Tuple[str, str]] = set()
+        for path in self._mp_pairs:
+            required.update(path)
+        for src, dst in required:
+            if any(s == src and d == dst for (s, _, d) in data.edge_types):
+                continue
+            reverse = None
+            for (s, rel, d) in data.edge_types:
+                if s == dst and d == src:
+                    reverse = (s, rel, d)
+                    break
+            if reverse is None:
+                raise RuntimeError(
+                    f"Meta-path requires relation {src}->{dst} but neither direct nor reverse edge exists."
+                )
+            edge_index = data[reverse].edge_index.flip(0).contiguous()
+            rel_name = f"{reverse[1]}_rev"
+            suffix = 1
+            while (src, rel_name, dst) in data.edge_types:
+                suffix += 1
+                rel_name = f"{reverse[1]}_rev{suffix}"
+            data[(src, rel_name, dst)].edge_index = edge_index
+
+    def _materialize_meta_graph(self, hetero: HeteroData) -> None:
+        if self._meta_graph_cpu is not None:
             return
-        device = next(self.parameters()).device
-        # Build HAN with dict in_channels (per node type)
-        in_channels = {nt: data[nt].x.size(1) for nt in data.node_types if 'x' in data[nt]}
-        metadata = data.metadata()
-        self._han1 = HANConv(in_channels, self.d_hid, metadata=metadata, heads=self.heads, dropout=self.dropout_p).to(device)
-        self._han2 = HANConv(self.d_hid, self.d_hid, metadata=metadata, heads=self.heads, dropout=self.dropout_p).to(device)
-        # Register as submodules so they’re picked up by .to(), .parameters(), etc.
-        self.add_module('han_conv1', self._han1)
-        self.add_module('han_conv2', self._han2)
-        self._built = True
+        base = hetero.cpu().clone()
+        self._ensure_required_pairs(base)
 
-    def _x_ei(self, data: HeteroData):
-        x_dict = {nt: data[nt].x for nt in data.node_types}
-        ei_dict = {et: data[et].edge_index for et in data.edge_types}
-        return x_dict, ei_dict
+        # 保留原始图以便从中复制单跳关系
+        pre_base = base.clone()
+        if self._meta_transform is not None:
+            base = self._meta_transform(base)
 
-    def _compute_mp_outputs_fixed(self, hetero: HeteroData, device: torch.device) -> Dict[str, torch.Tensor]:
-        """
-        Preserve the old semantics for mp_outputs so KD losses remain unchanged:
-        mp_output[key] = chain(op_norm) * proj(source_features_along_path_start)
-        """
-        x_dict = {nt: hetero[nt].x.to(device) for nt in hetero.node_types}
+        # 手动将单跳元路径添加为 metapath_* 边类型
+        def _count_existing_meta_edges(g: HeteroData) -> int:
+            return sum(1 for (_s, r, _d) in g.edge_types if isinstance(r, str) and r.startswith('metapath_'))
+
+        meta_counter = _count_existing_meta_edges(base)
+        for typed in self._single_typed:
+            if not typed:
+                continue
+            s, r, d = typed[0]
+            if (s, r, d) not in pre_base.edge_types:
+                continue
+            ei = pre_base[(s, r, d)].edge_index
+            new_rel = f"metapath_{meta_counter}"
+            base[(s, new_rel, d)].edge_index = ei.contiguous()
+            meta_counter += 1
+
+        # 如未运行AddMetaPaths且要求丢弃原始边，则仅保留metapath_*边
+        if self._meta_transform is None and self._drop_orig_edge_types:
+            keep = [et for et in base.edge_types if isinstance(et[1], str) and et[1].startswith('metapath_')]
+            pruned = HeteroData()
+            for nt in base.node_types:
+                pruned[nt].num_nodes = base[nt].num_nodes
+                if 'x' in base[nt]:
+                    pruned[nt].x = base[nt].x
+            for et in keep:
+                pruned[et].edge_index = base[et].edge_index
+            base = pruned
+
+        self._meta_graph_cpu = base
+        self._meta_metadata = base.metadata()
+
+        if self.han_conv1 is None:
+            param_device = self.tail_align.weight.device
+            self.han_conv1 = HANConv(-1, self.d_hid, metadata=self._meta_metadata, heads=self.heads, dropout=self.dropout_p).to(param_device)
+            self.han_conv2 = HANConv(self.d_hid, self.d_hid, metadata=self._meta_metadata, heads=self.heads, dropout=self.dropout_p).to(param_device)
+
+    def prepare_meta_graph(self, hetero: HeteroData) -> None:
+        """Explicitly build (or rebuild) the cached meta-path graph on CPU."""
+        self._meta_graph_cpu = None
+        self._meta_metadata = None
+        self.han_conv1 = None
+        self.han_conv2 = None
+        self._materialize_meta_graph(hetero)
+    def _clone_meta_graph(
+        self,
+        hetero: HeteroData,
+        device: torch.device,
+        feats_override: Optional[torch.Tensor],
+    ) -> HeteroData:
+        self._materialize_meta_graph(hetero)
+        assert self._meta_graph_cpu is not None
+        meta_graph = self._meta_graph_cpu.clone()
+        for nt in meta_graph.node_types:
+            if 'x' not in meta_graph[nt] or 'x' not in hetero[nt]:
+                continue
+            if nt == self.category and feats_override is not None:
+                feat = feats_override.detach()
+            else:
+                feat = hetero[nt].x.detach()
+            meta_graph[nt].x = feat.cpu()
+        return meta_graph.to(device)
+
+    # ------------------------------------------------------------------
+    # KD feature helpers
+    # ------------------------------------------------------------------
+    def _compute_mp_outputs_fixed(
+        self,
+        hetero: HeteroData,
+        device: torch.device,
+        feats_override: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        x_dict = {}
+        for nt in hetero.node_types:
+            if nt == self.category and feats_override is not None:
+                x_dict[nt] = feats_override.to(device)
+            else:
+                x_dict[nt] = hetero[nt].x.to(device)
         mp_outputs: Dict[str, torch.Tensor] = {}
         for key in self.metapath_keys:
             mp = self.metapaths[key]
             ops_info = self.ops_template[key]
             z = self.node_proj[mp[0][0]](x_dict[mp[0][0]])
             for op in ops_info['norm_ops']:
-                z = op.to(device).matmul(z)  # no nonlinearity here: mirrors previous KD signal
+                z = op.to(device).matmul(z)
             mp_outputs[key] = z
         return mp_outputs
 
-    def forward(self, hetero: HeteroData):
-        logits, *_ = self.forward_with_details(hetero)
+    def _extract_beta(
+        self,
+        sem_attn: Optional[Dict[str, torch.Tensor]],
+        meta_graph: HeteroData,
+        device: torch.device,
+    ) -> torch.Tensor:
+        num_nodes = meta_graph[self.category].num_nodes
+        num_paths = max(1, len(self.metapath_keys))
+        if not sem_attn or self.category not in sem_attn:
+            return torch.full((num_nodes, num_paths), 1.0 / num_paths, device=device)
+        beta = sem_attn[self.category].to(device)
+        if beta.dim() == 3:
+            beta = beta.mean(dim=1)
+        if beta.dim() == 1:
+            beta = beta.unsqueeze(0).expand(num_nodes, -1)
+        elif beta.size(0) != num_nodes:
+            beta = beta.reshape(num_nodes, -1)
+        return beta.contiguous()
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def forward(self, hetero: HeteroData, feats_override: Optional[torch.Tensor] = None):
+        logits, *_ = self.forward_with_details(hetero, feats_override=feats_override)
         return logits
 
-    def forward_with_details(self, hetero: HeteroData,
-                             device: Optional[torch.device] = None):
-        """
-        Returns:
-            logits: [N_cat, C]
-            mp_outputs: Dict[mp_key] -> [N_cat, d_hid]  (same as old teacher)
-            beta: [N_cat, M] semantic weights over meta-paths (from HAN)
-            alpha_maps: Dict[str, SparseTensor] (kept empty; HANConv does not expose them)
-            tail_baseline: [N_cat, d_hid] = linear(category_raw_x)
-        """
+    def forward_with_details(
+        self,
+        hetero: HeteroData,
+        device: Optional[torch.device] = None,
+        feats_override: Optional[torch.Tensor] = None,
+    ):
         device = device or next(self.parameters()).device
+        meta_graph = self._clone_meta_graph(hetero, device, feats_override)
 
-        # 1) Apply AddMetaPaths and move to device
-        g = self._transform(hetero.clone()).to(device)
+        tail_baseline = self.tail_align(meta_graph[self.category].x)
 
-        # 2) Lazily build HAN on transformed metadata
-        self._maybe_build(g)
+        x_dict = {nt: meta_graph[nt].x for nt in meta_graph.node_types}
+        edge_index_dict = {et: meta_graph[et].edge_index for et in meta_graph.edge_types}
 
-        # 3) Tail baseline (for KD relpos on meta-path deltas)
-        tail_baseline = self.tail_align(g[self.category].x)
+        h_dict = self.han_conv1(x_dict, edge_index_dict)
+        h_dict = {nt: self.dropout(self.act(h)) for nt, h in h_dict.items()}
 
-        # 4) HAN forward with semantic weights
-        x_dict, ei_dict = self._x_ei(g)
-        # First layer (no weights requested)
-        h = self._han1(x_dict, ei_dict)
-        h = {k: self.act(v) for k, v in h.items()}
-        h = {k: self.dropout(v) for k, v in h.items()}
-
-        # Second layer, request semantic weights (per node type)
-        out_dict, sem_attn = self._han2(h, ei_dict, return_semantic_attention_weights=True)
-
-        # 5) Classifier on category type
+        out_dict, sem_attn = self.han_conv2(
+            h_dict,
+            edge_index_dict,
+            return_semantic_attention_weights=True,
+        )
         logits = self.lin(out_dict[self.category])
 
-        # 6) Semantic beta over meta-paths for the category nodes
-        #    Because we dropped original edge types in the transform, sem_attn[self.category]
-        #    corresponds exactly to the list of meta-path-induced edge types, in the same order
-        #    that AddMetaPaths appended them (one weight per meta-path).
-        if sem_attn.get(self.category, None) is not None:
-            beta = sem_attn[self.category]  # [M] or [M,] stacked per-path weights
-            # HAN returns shape [num_paths] (shared?) or [num_paths] per node depending on impl;
-            # normalize to [N_cat, M]:
-            if beta.dim() == 1:
-                beta = beta.unsqueeze(0).expand(g[self.category].num_nodes, -1).contiguous()
-        else:
-            beta = torch.ones((g[self.category].num_nodes, max(1, len(self.metapath_keys))), device=device) / max(1, len(self.metapath_keys))
-
-        # 7) mp_outputs for KD (compute via fixed chains to preserve training signals)
-        mp_outputs = self._compute_mp_outputs_fixed(g, device)
-
-        # 8) alpha_maps: not available from HANConv; keep empty dict for compatibility
+        beta = self._extract_beta(sem_attn, meta_graph, device)
+        mp_outputs = self._compute_mp_outputs_fixed(hetero, device, feats_override)
         alpha_maps: Dict[str, SparseTensor] = {}
-
         return logits, mp_outputs, beta, alpha_maps, tail_baseline
 
-    # ---- KD helper projectors kept as-is ----
     def project_teacher_delta(self, delta: torch.Tensor) -> torch.Tensor:
         return self.delta_projector(delta)
 
     def project_student_delta(self, delta: torch.Tensor) -> torch.Tensor:
-        return self.delta_projector_student(delta)
-'''
-
-# =========================
+        return self.delta_projector_student(delta)# =========================
 # Loss components
 # =========================
 
@@ -996,7 +1022,9 @@ def train_metapath_teacher(args, hetero: HeteroData, category: str,
         num_classes=int(y.max().item()) + 1,
         semantic_hidden=args.han_semantic_hidden,
         dropout=args.han_dropout,
+        heads=args.han_heads,
     ).to(device)
+    model.prepare_meta_graph(hetero)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.han_lr, weight_decay=args.han_wd)
     best_state, best_val, best_te, patience = None, -1.0, 0.0, 0
@@ -1239,7 +1267,7 @@ def main():
     parser.add_argument('--teacher_norm', type=str, default='batch', choices=['none', 'batch', 'layer'])
     parser.add_argument('--teacher_lr', type=float, default=0.01)
     parser.add_argument('--teacher_wd', type=float, default=0.0)
-    parser.add_argument('--teacher_epochs', type=int, default=1)
+    parser.add_argument('--teacher_epochs', type=int, default=100)
     parser.add_argument('--teacher_patience', type=int, default=30)
 
     # teacher HAN-like
@@ -1249,7 +1277,7 @@ def main():
     parser.add_argument('--han_heads', type=int, default=8)
     parser.add_argument('--han_lr', type=float, default=0.005)
     parser.add_argument('--han_wd', type=float, default=0.001)
-    parser.add_argument('--han_epochs', type=int, default=200)
+    parser.add_argument('--han_epochs', type=int, default=300)
     parser.add_argument('--han_patience', type=int, default=40)
 
     # meta-path options
@@ -1262,7 +1290,7 @@ def main():
     parser.add_argument('--student_dropout', type=float, default=0.5)
     parser.add_argument('--student_lr', type=float, default=0.002)
     parser.add_argument('--student_wd', type=float, default=0.0005)
-    parser.add_argument('--student_epochs', type=int, default=1)
+    parser.add_argument('--student_epochs', type=int, default=1000)
     parser.add_argument('--student_patience', type=int, default=60)
 
     # KD weights
@@ -1391,3 +1419,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+

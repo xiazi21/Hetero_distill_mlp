@@ -100,7 +100,8 @@ class RSAGE_Hetero(nn.Module):
                  etypes: List[Tuple[str, str, str]],
                  in_dim: int, hid_dim: int, num_classes: int,
                  category: str, num_layers: int = 2, dropout: float = 0.2,
-                 norm_type: str = "none"):
+                 norm_type: str = "none",
+                 node_type_dims: Optional[Dict[str, int]] = None):
         super().__init__()
         self.category = category
         self.etypes = list(etypes)
@@ -115,6 +116,16 @@ class RSAGE_Hetero(nn.Module):
 
         def conv_dict(in_channels, out_channels):
             return {etype: SAGEConv(in_channels, out_channels, aggr='mean') for etype in self.etypes}
+
+        # Per-node-type projector to unify feature dims to in_dim (handles datasets like DBLP)
+        self.node_type_dims = node_type_dims
+        self.projectors = nn.ModuleDict()
+        if node_type_dims is not None:
+            for nt, dim in node_type_dims.items():
+                if dim != in_dim:
+                    self.projectors[nt] = nn.Linear(dim, in_dim, bias=False)
+                else:
+                    self.projectors[nt] = nn.Identity()
 
         if self.num_layers <= 1:
             self.layers.append(HeteroConv(conv_dict(in_dim, num_classes), aggr='mean'))
@@ -146,6 +157,10 @@ class RSAGE_Hetero(nn.Module):
         if feats_override is not None:
             x_dict[self.category] = feats_override
 
+        # Apply projectors if defined to unify all node-type feature dims
+        if len(self.projectors) > 0:
+            x_dict = {k: self.projectors[k](v) if k in self.projectors else v for k, v in x_dict.items()}
+
         edge_index_dict = {et: data[et].edge_index for et in data.edge_types}
         h = x_dict
         for l, layer in enumerate(self.layers):
@@ -164,6 +179,10 @@ class RSAGE_Hetero(nn.Module):
         x_dict = {k: data[k].x for k in data.node_types}
         if feats_override is not None:
             x_dict[self.category] = feats_override
+
+        # Apply projectors if defined to unify all node-type feature dims
+        if len(self.projectors) > 0:
+            x_dict = {k: self.projectors[k](v) if k in self.projectors else v for k, v in x_dict.items()}
 
         edge_index_dict = {et: data[et].edge_index for et in data.edge_types}
 
@@ -509,6 +528,8 @@ def evaluate_teacher(teacher: nn.Module,
             accuracy(logits, y, idx_test))
 
 def train_teacher(args, hetero, category, y, idx_train, idx_val, idx_test, device):
+    # Collect per-node-type feature dims to build projectors when needed (e.g., DBLP)
+    node_type_dims = {nt: hetero[nt].x.size(1) for nt in hetero.node_types}
     teacher = RSAGE_Hetero(
         etypes=list(hetero.edge_types),
         in_dim=hetero[category].x.size(1),
@@ -518,6 +539,7 @@ def train_teacher(args, hetero, category, y, idx_train, idx_val, idx_test, devic
         num_layers=args.teacher_layers,
         dropout=args.teacher_dropout,
         norm_type='none',
+        node_type_dims=node_type_dims,
     ).to(device)
 
     opt = torch.optim.Adam(teacher.parameters(), lr=args.teacher_lr, weight_decay=args.teacher_wd)
@@ -581,21 +603,42 @@ def train_student_relation_kd(args, hetero, category, y, idx_train, idx_val, idx
         rel_sequences = args.metapaths if args.metapaths else (metapaths_relnames or [])
         if rel_sequences:
             for rel_seq in rel_sequences:
-                tup = []
-                cur = category
-                for r in rel_seq:
-                    cand = None
-                    for (s, rr, d) in hetero.edge_types:
-                        if rr == r and s == cur:
-                            cand = (s, rr, d)
-                            cur = d
+                if not rel_seq:
+                    continue
+                # Support either relation-name sequences or explicit (src, rel, dst) tuples
+                first = rel_seq[0]
+                if isinstance(first, (list, tuple)) and len(first) == 3:
+                    cur = category
+                    tup = []
+                    valid = True
+                    for edge in rel_seq:
+                        if not (isinstance(edge, (list, tuple)) and len(edge) == 3):
+                            valid = False
                             break
-                    if cand is None:
-                        tup = []
-                        break
-                    tup.append(cand)
-                if tup and tup[-1][2] == category:
-                    mp_tuples.append(tup)
+                        s, rr, d = edge
+                        if s != cur or (s, rr, d) not in hetero.edge_types:
+                            valid = False
+                            break
+                        tup.append((s, rr, d))
+                        cur = d
+                    if valid and cur == category:
+                        mp_tuples.append(tup)
+                else:
+                    tup = []
+                    cur = category
+                    for r in rel_seq:
+                        cand = None
+                        for (s, rr, d) in hetero.edge_types:
+                            if rr == r and s == cur:
+                                cand = (s, rr, d)
+                                cur = d
+                                break
+                        if cand is None:
+                            tup = []
+                            break
+                        tup.append(cand)
+                    if tup and tup[-1][2] == category:
+                        mp_tuples.append(tup)
             if not mp_tuples:
                 print("[PE] No valid metapath tuples found; skipping MetaPath2Vec.")
         else:
@@ -763,7 +806,7 @@ def train_student_relation_kd(args, hetero, category, y, idx_train, idx_val, idx
 # =========================
 def main():
     p = argparse.ArgumentParser("Relation-only KD (logits + relation relative position, reliability-weighted)")
-    p.add_argument("-d", "--dataset", type=str, default="TMDB", choices=["TMDB", "CroVal", "ArXiv", "IGB-tiny-549K-19", "IGB-small-549K-2983", "DBLP"])
+    p.add_argument("-d", "--dataset", type=str, default="TMDB", choices=["TMDB", "CroVal", "ArXiv", "IGB-tiny-549K-19", "IGB-small-549K-2983", "DBLP", "IMDB"])
     p.add_argument("--gpu_id", type=int, default=-1)
     p.add_argument("--seed", type=int, default=0)
 
@@ -780,10 +823,10 @@ def main():
     p.add_argument("--student_hidden", type=int, default=128)
     p.add_argument("--student_layers", type=int, default=2)
     p.add_argument("--student_dropout", type=float, default=0.5)
-    p.add_argument("--student_lr", type=float, default=2e-3)
-    p.add_argument("--student_wd", type=float, default=5e-4)
+    p.add_argument("--student_lr", type=float, default=0.01)
+    p.add_argument("--student_wd", type=float, default=0)
     p.add_argument("--student_epochs", type=int, default=1000)
-    p.add_argument("--student_patience", type=int, default=500)
+    p.add_argument("--student_patience", type=int, default=10)
 
     # KD + relation loss
     p.add_argument("--kd_T", type=float, default=1.0)
@@ -791,7 +834,7 @@ def main():
     p.add_argument("--kd_coeff", type=float, default=1, help="weight on KD (reliability-weighted)")
     p.add_argument("--lambda_rel_pos", type=float, default=1, help="weight on relation relative-position L2")
     p.add_argument("--rel_dim", type=int, default=256, help="relation adapter projection dim for student")
-    p.add_argument("--lambda_rel_struct", type=float, default=1, help="weight on relation structural CE")
+    p.add_argument("--lambda_rel_struct", type=float, default=10, help="weight on relation structural CE")
     p.add_argument("--struct_head_lr", type=float, default=2e-3, help="lr for relation structural head")
     p.add_argument("--struct_head_wd", type=float, default=1e-4, help="weight decay for relation structural head")
     p.add_argument("--use_positional_encoding", action="store_true", help="augment student inputs with MetaPath2Vec positional encodings")
@@ -810,7 +853,7 @@ def main():
                    help="number of timed inference runs (0 to disable)")
     p.add_argument("--reseed_student", action="store_true",
                    help="reseed student-specific randomness using seed + student_seed_offset")
-    p.add_argument("--student_seed_offset", type=int, default=1234,
+    p.add_argument("--student_seed_offset", type=int, default=0,
                    help="offset added to seed when reseeding student components")
 
     args = p.parse_args()

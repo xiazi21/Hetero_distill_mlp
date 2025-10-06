@@ -47,12 +47,13 @@ except ImportError:
         
         return out / count.unsqueeze(-1)
 from torch_geometric.data import HeteroData  # 导入 PyG 的异构图数据结构 HeteroData
+import torch.nn as nn
 from torch_geometric.utils import (  # 导入若干图操作工具函数
     coalesce,  # 合并重复边并排序
     remove_self_loops,  # 移除自环边（u==v）
     add_self_loops,  # 为同型关系添加自环
 )
-from torch_geometric.datasets import DBLP as PYG_DBLP, AMiner as PYG_AMINER  # PyG datasets
+from torch_geometric.datasets import DBLP as PYG_DBLP, AMiner as PYG_AMINER, IMDB as PYG_IMDB  # PyG datasets
 from torch_geometric.transforms import RandomNodeSplit
 
 
@@ -330,8 +331,8 @@ def load_data(dataset: str = 'TMDB', return_mp: bool = False):
         idx_val = torch.from_numpy(((paper_years >= 2018) & (paper_years <= 2018)).nonzero()[0]).long()  # 验证集
         idx_test = torch.from_numpy((paper_years >= 2019).nonzero()[0]).long()  # 测试集
 
-        # 元路径定义（与原返回一致）
-        metapaths: List[List[str]] = [['cites'], ['written_by', 'writes']]  # cites 为长度-1，另一条长度-2
+        # 元路径定义：保留单跳 cites（后续由MetaPathTeacher手动添加）与跨类型两跳
+        metapaths: List[List[str]] = [['cites'], ['written_by', 'writes']]
 
     elif 'IGB' in dataset:  # 分支：IGB（Industry Graph Benchmark，变体名中包含 IGB）
         # 解析数据规模与类别数（与原脚本一致）
@@ -462,8 +463,9 @@ def load_data(dataset: str = 'TMDB', return_mp: bool = False):
         def generate_node_features(g: HeteroData, proj_dim: int = 0) -> HeteroData:
             """
             1) 对缺失 .x 的节点类型，尝试通过"有特征节点 → 该类型"的边做均值聚合补齐特征；
-            2) 若 proj_dim>0，则为所有类型用一层线性层投到同一维度（方便模型统一处理）。
-               注意：这是数据级转换（固定权），若想让投影可学习，请用下文对 train_and_eval 的改动。
+            2) 将所有类型用可学习线性层投到同一维度（方便模型统一处理）。
+               目标维度优先使用传入的 proj_dim；若未指定，则使用类别节点（g.category）的特征维度。
+               投影模块保存在 g.feature_projector 以便训练时加入优化器。
             """
             # 1) complete missing x via neighbor mean (单跳，从任意有 x 的源到 x 缺失的目标)
             need = [nt for nt in g.node_types if 'x' not in g[nt]]
@@ -475,18 +477,42 @@ def load_data(dataset: str = 'TMDB', return_mp: bool = False):
                         g[dt].x = _neighbor_mean_aggregate(g[st].x, g[(st, rel, dt)].edge_index, num_dst=num_dst)
                         g[dt].feat = g[dt].x
 
-            # 2) optional: project all node features to same dim (非学习版；保持接口不变)
+            # 2) trainable: project all node features to same dim via per-type Linear
+            #    target_dim 优先 proj_dim，其次使用类别节点特征维度（若存在）
+            target_dim = None
             if proj_dim and proj_dim > 0:
-                with torch.no_grad():
+                target_dim = int(proj_dim)
+            else:
+                category = getattr(g, 'category', None)
+                if category is not None and ('x' in g[category]):
+                    target_dim = int(g[category].x.size(-1))
+
+            if target_dim is not None:
+                # 构建或复用投影模块，保存在 g.feature_projector
+                projector = getattr(g, 'feature_projector', None)
+                if projector is None:
+                    projector = nn.ModuleDict()
                     for nt in g.node_types:
                         if 'x' in g[nt]:
-                            x = g[nt].x
-                            F = x.size(-1)
-                            if F != proj_dim:
-                                # 用固定随机矩阵（正交近似）将维度统一，避免下游模型不一致
-                                W = torch.randn(F, proj_dim, device=x.device) / np.sqrt(max(1, F))
-                                g[nt].x = x @ W
-                                g[nt].feat = g[nt].x
+                            in_dim = int(g[nt].x.size(-1))
+                            if in_dim == target_dim:
+                                projector[nt] = nn.Identity()
+                            else:
+                                projector[nt] = nn.Linear(in_dim, target_dim, bias=False)
+                    # 将模块移动到类别节点设备（若存在），否则移动到第一个已存在特征的设备
+                    ref_nt = category if (getattr(g, 'category', None) and ('x' in g[g.category])) else next(
+                        (nt for nt in g.node_types if 'x' in g[nt]), None
+                    )
+                    if ref_nt is not None:
+                        projector.to(g[ref_nt].x.device)
+                    # 将模块挂载到图对象，便于外部优化器收集参数
+                    g.feature_projector = projector
+
+                # 执行投影
+                for nt in g.node_types:
+                    if 'x' in g[nt] and nt in projector:
+                        g[nt].x = projector[nt](g[nt].x).detach()
+                        g[nt].feat = g[nt].x
             return g
 
         # 基于实际存在的 etype 构建以 author 为首尾的元路径（使用 etype 元组，避免 PyG DBLP 中 rel 名称均为 'to' 的歧义）
@@ -532,6 +558,7 @@ def load_data(dataset: str = 'TMDB', return_mp: bool = False):
         # (PyG docs: AMiner has labels for a subset)  -> we filter valid label indices (>=0) then split
         y = data[category].y
         labeled_mask = (y >= 0) if y.dtype == torch.long else torch.isfinite(y)
+        
         # Apply RandomNodeSplit on that node type only
         splitter = RandomNodeSplit(
             split='train_rest', num_val=0.2, num_test=0.2, key='y',
@@ -540,9 +567,33 @@ def load_data(dataset: str = 'TMDB', return_mp: bool = False):
         data = splitter(data)
 
         # Build indices restricted to labeled nodes
-        idx_train = (data[category].train_mask & labeled_mask).nonzero(as_tuple=True)[0].long()
-        idx_val   = (data[category].val_mask & labeled_mask).nonzero(as_tuple=True)[0].long()
-        idx_test  = (data[category].test_mask & labeled_mask).nonzero(as_tuple=True)[0].long()
+        # RandomNodeSplit creates masks for all nodes, but we only want labeled ones
+        train_mask = data[category].train_mask
+        val_mask = data[category].val_mask
+        test_mask = data[category].test_mask
+        
+        # Ensure masks have same size as labeled_mask
+        if train_mask.size(0) != labeled_mask.size(0):
+            # If sizes don't match, assume masks are for all nodes but labels are subset
+            # Create full-size masks and apply labeled_mask
+            full_train_mask = torch.zeros_like(labeled_mask, dtype=torch.bool)
+            full_val_mask = torch.zeros_like(labeled_mask, dtype=torch.bool)
+            full_test_mask = torch.zeros_like(labeled_mask, dtype=torch.bool)
+            
+            # Apply the split masks only to labeled nodes
+            labeled_indices = labeled_mask.nonzero(as_tuple=True)[0]
+            if labeled_indices.size(0) > 0:
+                full_train_mask[labeled_indices] = train_mask[:labeled_indices.size(0)]
+                full_val_mask[labeled_indices] = val_mask[:labeled_indices.size(0)]
+                full_test_mask[labeled_indices] = test_mask[:labeled_indices.size(0)]
+            
+            train_mask = full_train_mask
+            val_mask = full_val_mask
+            test_mask = full_test_mask
+        
+        idx_train = (train_mask & labeled_mask).nonzero(as_tuple=True)[0].long()
+        idx_val   = (val_mask & labeled_mask).nonzero(as_tuple=True)[0].long()
+        idx_test  = (test_mask & labeled_mask).nonzero(as_tuple=True)[0].long()
 
         # Aliases for compatibility
         if data[category].y is not None:
@@ -565,7 +616,7 @@ def load_data(dataset: str = 'TMDB', return_mp: bool = False):
 
         # ---- Feature completion & (optional) projection done in generate_node_features() ----
         def generate_node_features(g: HeteroData, proj_dim: int = 0) -> HeteroData:
-            # Same logic as DBLP branch
+            # Same logic as DBLP branch (completion + trainable projection)
             need = [nt for nt in g.node_types if 'x' not in g[nt]]
             if len(need) > 0:
                 for (st, rel, dt) in g.edge_types:
@@ -573,24 +624,152 @@ def load_data(dataset: str = 'TMDB', return_mp: bool = False):
                         num_dst = g[dt].num_nodes
                         g[dt].x = _neighbor_mean_aggregate(g[st].x, g[(st, rel, dt)].edge_index, num_dst=num_dst)
                         g[dt].feat = g[dt].x
+
+            target_dim = None
             if proj_dim and proj_dim > 0:
-                with torch.no_grad():
+                target_dim = int(proj_dim)
+            else:
+                category = getattr(g, 'category', None)
+                if category is not None and ('x' in g[category]):
+                    target_dim = int(g[category].x.size(-1))
+
+            if target_dim is not None:
+                projector = getattr(g, 'feature_projector', None)
+                if projector is None:
+                    projector = nn.ModuleDict()
                     for nt in g.node_types:
                         if 'x' in g[nt]:
-                            x = g[nt].x
-                            F = x.size(-1)
-                            if F != proj_dim:
-                                W = torch.randn(F, proj_dim, device=x.device) / np.sqrt(max(1, F))
-                                g[nt].x = x @ W
-                                g[nt].feat = g[nt].x
+                            in_dim = int(g[nt].x.size(-1))
+                            projector[nt] = nn.Identity() if in_dim == target_dim else nn.Linear(in_dim, target_dim, bias=False)
+                    ref_nt = category if (getattr(g, 'category', None) and ('x' in g[g.category])) else next(
+                        (nt for nt in g.node_types if 'x' in g[nt]), None
+                    )
+                    if ref_nt is not None:
+                        projector.to(g[ref_nt].x.device)
+                    g.feature_projector = projector
+
+                for nt in g.node_types:
+                    if 'x' in g[nt] and nt in projector:
+                        g[nt].x = projector[nt](g[nt].x).detach()
+                        g[nt].feat = g[nt].x
             return g
 
         # Build metapaths from what exists
-        metapaths: List[List[str]] = []
-        if ('paper', 'written_by', 'author') in data.edge_types and ('author', 'writes', 'paper') in data.edge_types:
-            metapaths.append(['written_by', 'writes'])
-        if ('paper', 'published_in', 'venue') in data.edge_types and ('venue', 'publishes', 'paper') in data.edge_types:
-            metapaths.append(['published_in', 'publishes'])
+        metapaths: List[List[tuple]] = []
+        has = set(data.edge_types)
+        
+        # Build metapaths based on actual edge types in AMINER
+        # AMINER typically has: author-paper-venue relationships
+        if category == 'author':
+            # APA: author -> paper -> author
+            if ('author', 'writes', 'paper') in has and ('paper', 'written_by', 'author') in has:
+                metapaths.append([('author', 'writes', 'paper'), ('paper', 'written_by', 'author')])
+            # APVA: author -> paper -> venue -> paper -> author
+            if ('author', 'writes', 'paper') in has and ('paper', 'published_in', 'venue') in has and ('venue', 'publishes', 'paper') in has and ('paper', 'written_by', 'author') in has:
+                metapaths.append([
+                    ('author', 'writes', 'paper'),
+                    ('paper', 'published_in', 'venue'),
+                    ('venue', 'publishes', 'paper'),
+                    ('paper', 'written_by', 'author')
+                ])
+        elif category == 'venue':
+            # VPV: venue -> paper -> venue
+            if ('venue', 'publishes', 'paper') in has and ('paper', 'published_in', 'venue') in has:
+                metapaths.append([('venue', 'publishes', 'paper'), ('paper', 'published_in', 'venue')])
+            # VPAV: venue -> paper -> author -> paper -> venue
+            if ('venue', 'publishes', 'paper') in has and ('paper', 'written_by', 'author') in has and ('author', 'writes', 'paper') in has and ('paper', 'published_in', 'venue') in has:
+                metapaths.append([
+                    ('venue', 'publishes', 'paper'),
+                    ('paper', 'written_by', 'author'),
+                    ('author', 'writes', 'paper'),
+                    ('paper', 'published_in', 'venue')
+                ])
+        
+
+    elif dataset == 'IMDB':
+        # --- Load from PyG (downloads on first run) ---
+        pyg_ds = PYG_IMDB(root='./data/pyg_imdb')  # creates ./data/pyg_imdb/*
+        data: HeteroData = pyg_ds[0]
+
+        # IMDB task: movie classification (3 classes). PyG ships masks for movies.
+        assert 'movie' in data.node_types, 'IMDB must have movie node type'
+        assert data['movie'].y is not None, 'IMDB must provide movie labels'
+        assert 'train_mask' in data['movie'] and 'val_mask' in data['movie'] and 'test_mask' in data['movie'], \
+            'IMDB in PyG provides predefined masks for movies'
+
+        # Build indices from masks:
+        idx_train = data['movie'].train_mask.nonzero(as_tuple=True)[0].long()
+        idx_val   = data['movie'].val_mask.nonzero(as_tuple=True)[0].long()
+        idx_test  = data['movie'].test_mask.nonzero(as_tuple=True)[0].long()
+
+        # Keep consistent field aliases + category
+        data['movie'].label = data['movie'].y
+        for ntype in data.node_types:
+            if 'x' in data[ntype]:
+                data[ntype].feat = data[ntype].x
+        data.category = 'movie'
+
+        # Coalesce edges (keeps your original behavior)
+        for et in data.edge_types:
+            st, _, dt = et
+            data[et].edge_index = _coalesce_relation(data[et].edge_index, (data[st].num_nodes, data[dt].num_nodes))
+
+        # ---- Feature completion done by generate_node_features() below ----
+        def generate_node_features(g: HeteroData, proj_dim: int = 0) -> HeteroData:
+            """
+            1) 对缺失 .x 的节点类型，尝试通过"有特征节点 → 该类型"的边做均值聚合补齐特征；
+            2) 将所有类型用可学习线性层投到同一维度（优先使用 proj_dim，否则用类别节点维度）。
+               投影模块保存在 g.feature_projector 以便训练时加入优化器。
+            """
+            # 1) complete missing x via neighbor mean (单跳，从任意有 x 的源到 x 缺失的目标)
+            need = [nt for nt in g.node_types if 'x' not in g[nt]]
+            if len(need) > 0:
+                # 对每条关系，若 src 有 x、dst 无 x，则从 src 聚合到 dst
+                for (st, rel, dt) in g.edge_types:
+                    if ('x' in g[st]) and ('x' not in g[dt]):
+                        num_dst = g[dt].num_nodes
+                        g[dt].x = _neighbor_mean_aggregate(g[st].x, g[(st, rel, dt)].edge_index, num_dst=num_dst)
+                        g[dt].feat = g[dt].x
+
+            # 2) trainable projection per node type
+            target_dim = None
+            if proj_dim and proj_dim > 0:
+                target_dim = int(proj_dim)
+            else:
+                category = getattr(g, 'category', None)
+                if category is not None and ('x' in g[category]):
+                    target_dim = int(g[category].x.size(-1))
+
+            if target_dim is not None:
+                projector = getattr(g, 'feature_projector', None)
+                if projector is None:
+                    projector = nn.ModuleDict()
+                    for nt in g.node_types:
+                        if 'x' in g[nt]:
+                            in_dim = int(g[nt].x.size(-1))
+                            projector[nt] = nn.Identity() if in_dim == target_dim else nn.Linear(in_dim, target_dim, bias=False)
+                    ref_nt = category if (getattr(g, 'category', None) and ('x' in g[g.category])) else next(
+                        (nt for nt in g.node_types if 'x' in g[nt]), None
+                    )
+                    if ref_nt is not None:
+                        projector.to(g[ref_nt].x.device)
+                    g.feature_projector = projector
+
+                for nt in g.node_types:
+                    if 'x' in g[nt] and nt in projector:
+                        g[nt].x = projector[nt](g[nt].x).detach()
+                        g[nt].feat = g[nt].x
+            return g
+
+        # 基于实际存在的 etype 构建以 movie 为首尾的元路径（使用 etype 元组）
+        metapaths: List[List[tuple]] = []
+        has = set(data.edge_types)
+        # MAM: movie -> actor -> movie
+        if ('movie', 'to', 'actor') in has and ('actor', 'to', 'movie') in has:
+            metapaths.append([('movie', 'to', 'actor'), ('actor', 'to', 'movie')])
+        # MDM: movie -> director -> movie
+        if ('movie', 'to', 'director') in has and ('director', 'to', 'movie') in has:
+            metapaths.append([('movie', 'to', 'director'), ('director', 'to', 'movie')])
 
     else:  # 分支：未知数据集名
         raise ValueError(f'Unsupported dataset: {dataset}')  # 对未知名称抛出异常，提示调用方
