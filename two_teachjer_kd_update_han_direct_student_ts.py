@@ -313,6 +313,10 @@ class GraphFreeStudent(nn.Module):
         stacked = torch.stack(collected, dim=0).mean(dim=0)
         return self.struct_classifier(stacked)
 
+    def structural_logits_direct(self, rel_base: torch.Tensor, category: str) -> torch.Tensor:
+        """直接使用MLP特征进行结构分类，不依赖关系嵌入字典"""
+        return self.struct_classifier(rel_base)
+
     def meta_path_attention(self, mp_embs: Dict[str, torch.Tensor], keys: List[str]) -> torch.Tensor:
         if not mp_embs:
             raise ValueError("meta_path_attention requires non-empty embeddings")
@@ -820,41 +824,112 @@ def _edge_relpos(emb_dst: torch.Tensor, emb_src_in: torch.Tensor, ei: torch.Tens
     return torch.cat([cosine_sim, euclidean], dim=-1)
 
 
-def relation_relative_pos_l2(taps_teacher: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]],
-                             rel_student: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]],
-                             hetero: HeteroData,
-                             category: str,
-                             reliability: Optional[torch.Tensor] = None,
-                             projector_t: Optional[nn.Module] = None,
-                             projector_s: Optional[nn.Module] = None) -> torch.Tensor:
-    losses = []
+def relation_relative_pos_l2(
+    taps_teacher: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]],
+    rel_student: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]],
+    hetero: HeteroData,
+    category: str,
+    reliability: Optional[torch.Tensor] = None,
+    projector_t: Optional[nn.Module] = None,
+    projector_s: Optional[nn.Module] = None,
+    relation_weights: Optional[Dict[Tuple[str, str, str], float]] = None,
+    return_details: bool = False,
+    include_per_edge: bool = False,
+) -> Union[torch.Tensor, Dict[str, Union[torch.Tensor, Dict[Tuple[str, str, str], Dict[str, Union[int, float, torch.Tensor]]]]]]:
+    """
+    Relation-wise L2 loss between teacher taps and student relation embeddings.
+
+    Enhancements:
+    - relation_weights: optional weights per edge-type when aggregating relation losses
+    - return_details: if True, returns a dict with total_loss and per-relation statistics
+    - include_per_edge: if True with return_details, includes per-edge loss tensors (can be large)
+    """
+    losses: List[torch.Tensor] = []
     device = reliability.device if reliability is not None else hetero[category].x.device
-    for et in hetero.edge_types:
-        if et not in taps_teacher or et not in rel_student:
-            continue
-        src, _, dst = et
-        if dst != category:
-            continue
+
+    # Aggregation for weighted mean across relations
+    weighted_sum: Optional[torch.Tensor] = None
+    total_weight: float = 0.0
+
+    # Optional stats container
+    relation_stats: Dict[Tuple[str, str, str], Dict[str, Union[int, float, torch.Tensor]]] = {}
+    relation_mean_tensors: Dict[Tuple[str, str, str], torch.Tensor] = {}
+
+    # 仅对目标类别为 dst==category 且在两侧字典中均存在的边类型进行蒸馏，避免无关警告
+    candidate_edge_types = [
+        et for et in hetero.edge_types
+        if (et in taps_teacher and et in rel_student and et[2] == category)
+    ]
+
+    for et in candidate_edge_types:
+
         ei = hetero[et].edge_index.to(device)
         emb_t_dst = taps_teacher[et]['dst'].to(device)
         emb_t_src = taps_teacher[et]['src_in'].to(device)
         emb_s_dst = rel_student[et]['dst']
         emb_s_src = rel_student[et]['src_in']
+
         if projector_t is not None:
             emb_t_dst = projector_t(emb_t_dst)
             emb_t_src = projector_t(emb_t_src)
         if projector_s is not None:
             emb_s_dst = projector_s(emb_s_dst)
             emb_s_src = projector_s(emb_s_src)
+
         rel_t = _edge_relpos(emb_t_dst, emb_t_src, ei)
         rel_s = _edge_relpos(emb_s_dst, emb_s_src, ei)
         l2 = (rel_t - rel_s).pow(2).sum(dim=-1) / rel_t.size(1)
-        #if reliability is not None:
-        #    l2 = l2 * reliability[ei[1].long()]
-        losses.append(l2.mean())
+
+        # Optional per-edge reliability weighting
+        if reliability is not None:
+            l2 = l2 * reliability[ei[1].long()]
+
+        rel_mean = l2.mean()
+        losses.append(rel_mean)
+
+        # Relation-level weighting
+        w = 1.0
+        if relation_weights is not None and et in relation_weights:
+            w = float(relation_weights[et])
+
+        weighted_term = rel_mean * w
+        weighted_sum = weighted_term if weighted_sum is None else (weighted_sum + weighted_term)
+        total_weight += w
+
+        if return_details:
+            # Collect stats for monitoring/debugging
+            rel_std = (l2.std() if l2.numel() > 1 else torch.tensor(0.0, device=l2.device))
+            relation_stats[et] = {
+                'mean_loss': float(rel_mean.detach().cpu().item()),
+                'std_loss': float(rel_std.detach().cpu().item()),
+                'min_loss': float(l2.min().detach().cpu().item()),
+                'max_loss': float(l2.max().detach().cpu().item()),
+                'num_edges': int(l2.numel()),
+                'weight': float(w),
+            }
+            # Keep gradient-carrying per-relation mean tensor for custom optimization
+            relation_mean_tensors[et] = rel_mean
+            if include_per_edge:
+                relation_stats[et]['per_edge_loss'] = l2.detach().cpu()
+
     if not losses:
-        return torch.tensor(0.0, device=device)
-    return torch.stack(losses).mean()
+        zero = torch.tensor(0.0, device=device)
+        if return_details:
+            return {'total_loss': zero, 'relation_stats': {}, 'num_relations': 0}
+        return zero
+
+    # Use weighted mean if weights provided, otherwise plain mean
+    total_loss = (weighted_sum / total_weight) if (total_weight > 0 and weighted_sum is not None) else torch.stack(losses).mean()
+
+    if return_details:
+        return {
+            'total_loss': total_loss,
+            'relation_stats': relation_stats,
+            'relation_mean_tensors': relation_mean_tensors,
+            'num_relations': len(relation_stats),
+        }
+
+    return total_loss
 
 
 def meta_path_feature_loss(mp_teacher: Dict[str, torch.Tensor],
@@ -1161,9 +1236,10 @@ def train_student_dual_kd(args,
     use_direct_aux = not getattr(args, 'no_direct_aux', False)
     print(f"use_direct_aux: {use_direct_aux}")
 
-    node_dims_rel = dict(node_dims)
-    node_dims_rel[category] = student.rel_dim
-    rel_adapter = RelKDAdapter(node_dims_rel, d_rel=student.rel_dim).to(device)
+    # 取消RelKDAdapter，直接使用MLP特征进行关系蒸馏
+    # node_dims_rel = dict(node_dims)
+    # node_dims_rel[category] = student.rel_dim
+    # rel_adapter = RelKDAdapter(node_dims_rel, d_rel=student.rel_dim).to(device)
 
     node_dims_mp = dict(node_dims)
     node_dims_mp[category] = student.mp_dim
@@ -1209,7 +1285,6 @@ def train_student_dual_kd(args,
 
     params = (
         list(student.parameters())
-        + list(rel_adapter.parameters())
         + list(mp_adapter.parameters())
         + list(teacher_delta_proj.parameters())
     )
@@ -1241,8 +1316,41 @@ def train_student_dual_kd(args,
         mp_base_aux = mp_base    # 保持梯度连接
         tail_student_aux = tail_student  # 保持梯度连接
 
-        rel_overrides = {category: rel_base_aux}
-        rel_student = rel_adapter(hetero, list(hetero.edge_types), node_overrides=rel_overrides, device=device)
+        # 直接使用MLP特征进行关系蒸馏，取消RelKDAdapter
+        # 创建简化的学生关系嵌入：为每个边类型创建正确的节点嵌入
+        rel_student = {}
+        for et in hetero.edge_types:
+            src, _, dst = et
+            if dst == category:  # 只处理目标节点是目标类别的边
+                # 为源节点和目标节点创建正确大小的嵌入
+                # 目标节点使用rel_base_aux（目标类别节点的嵌入）
+                # 源节点需要创建对应大小的嵌入
+                src_num_nodes = hetero[src].num_nodes
+                dst_num_nodes = hetero[dst].num_nodes
+                
+                # 为目标节点创建嵌入（使用rel_base_aux）
+                dst_emb = rel_base_aux
+                
+                # 为源节点创建嵌入（需要扩展到源节点数量）
+                if src_num_nodes == dst_num_nodes:
+                    # 如果源节点和目标节点数量相同，直接使用rel_base_aux
+                    src_emb = rel_base_aux
+                else:
+                    # 如果数量不同，需要扩展或截断rel_base_aux
+                    if src_num_nodes > dst_num_nodes:
+                        # 源节点更多，需要扩展
+                        padding_size = src_num_nodes - dst_num_nodes
+                        padding = torch.zeros(padding_size, rel_base_aux.size(1), 
+                                            device=rel_base_aux.device, dtype=rel_base_aux.dtype)
+                        src_emb = torch.cat([rel_base_aux, padding], dim=0)
+                    else:
+                        # 源节点更少，需要截断
+                        src_emb = rel_base_aux[:src_num_nodes]
+                
+                rel_student[et] = {
+                    'dst': dst_emb,      # 目标节点嵌入
+                    'src_in': src_emb    # 源节点输入嵌入
+                }
 
         taps_projected = {}
         for et, mm in taps.items():
@@ -1253,16 +1361,30 @@ def train_student_dual_kd(args,
             if rel_t_src_proj is not None:
                 t_src = rel_t_src_proj(t_src)
             taps_projected[et] = {'dst': t_dst, 'src_in': t_src}
+        
 
-        rel_loss = relation_relative_pos_l2(taps_teacher=taps_projected,
-                                            rel_student=rel_student,
-                                            hetero=hetero,
-                                            category=category,
-                                            reliability=rho_r,
-                                            projector_t=None,
-                                            projector_s=None) * args.lambda_rel_pos
+        rel_out = relation_relative_pos_l2(taps_teacher=taps_projected,
+                                           rel_student=rel_student,
+                                           hetero=hetero,
+                                           category=category,
+                                           reliability=rho_r,
+                                           projector_t=None,
+                                           projector_s=None,
+                                           relation_weights=None,
+                                           return_details=True,
+                                           include_per_edge=False)
 
-        struct_logits = student.structural_logits(rel_student, category)
+        # 按边类型求和（而非均值）：最小化每个边类型的损失并汇总到总损失
+        if isinstance(rel_out, dict) and 'relation_mean_tensors' in rel_out and len(rel_out['relation_mean_tensors']) > 0:
+            rel_means = torch.stack(list(rel_out['relation_mean_tensors'].values()))
+            rel_loss_core = rel_means.sum()
+        else:
+            # 回退到标量总损失
+            rel_loss_core = rel_out['total_loss'] if isinstance(rel_out, dict) else rel_out
+
+        rel_loss = rel_loss_core * args.lambda_rel_pos
+
+        struct_logits = student.structural_logits_direct(rel_base_aux, category)
         struct_loss = torch.tensor(0.0, device=device)
         if struct_logits is not None and args.lambda_rel_struct > 0:
             struct_loss = F.cross_entropy(struct_logits[idx_train], y[idx_train]) * args.lambda_rel_struct
@@ -1358,8 +1480,8 @@ def main():
     parser.add_argument('--student_hidden', type=int, default=128)
     parser.add_argument('--student_layers', type=int, default=2)
     parser.add_argument('--student_dropout', type=float, default=0.5)
-    parser.add_argument('--student_lr', type=float, default=0.001)
-    parser.add_argument('--student_wd', type=float, default=0.0001)
+    parser.add_argument('--student_lr', type=float, default=0.005)
+    parser.add_argument('--student_wd', type=float, default=0.0)
     parser.add_argument('--student_epochs', type=int, default=1000)
     parser.add_argument('--student_patience', type=int, default=1000)
     parser.add_argument('--no_direct_aux', action='store_true',
@@ -1367,9 +1489,9 @@ def main():
 
     # KD weights
     parser.add_argument('--kd_T', type=float, default=1.0)
-    parser.add_argument('--ce_coeff', type=float, default=1)
-    parser.add_argument('--kd_coeff', type=float, default= 0)
-    parser.add_argument('--lambda_rel_pos', type=float, default=1)
+    parser.add_argument('--ce_coeff', type=float, default=0)
+    parser.add_argument('--kd_coeff', type=float, default= 1)
+    parser.add_argument('--lambda_rel_pos', type=float, default=0)
     parser.add_argument('--lambda_rel_struct', type=float, default=0)
     parser.add_argument('--lambda_mp_feat', type=float, default=0)
     parser.add_argument('--lambda_mp_relpos', type=float, default=0)
