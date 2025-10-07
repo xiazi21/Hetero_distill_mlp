@@ -36,6 +36,7 @@ from torch_geometric.nn.models import MetaPath2Vec
 from torch_sparse import SparseTensor
 import torch_sparse
 
+
 from dataloader import load_data
 
 # =========================
@@ -246,20 +247,86 @@ def build_metapath_operators(hetero: HeteroData,
 # Student components (MLP + adapters)
 # =========================
 
-class MLPClassifier(nn.Module):
+
+class GraphFreeStudent(nn.Module):
     def __init__(self, d_in: int, n_classes: int,
-                 hidden: int = 256, num_layers: int = 2, dropout: float = 0.5):
+                 hidden: int = 256, num_layers: int = 2, dropout: float = 0.5,
+                 rel_dim: int = 128, mp_dim: int = 128, delta_dim: int = 128,
+                 beta_hidden: int = 128):
         super().__init__()
-        dims = [d_in] + [hidden] * max(0, num_layers - 1) + [n_classes]
-        layers: List[nn.Module] = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers += [nn.ReLU(), nn.Dropout(dropout)]
-        self.net = nn.Sequential(*layers)
+        hidden_layers = max(0, num_layers - 1)
+        self.blocks = nn.ModuleList()
+        prev = d_in
+        for _ in range(hidden_layers):
+            block = nn.Sequential(
+                nn.Linear(prev, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            self.blocks.append(block)
+            prev = hidden
+
+        self.feature_dim = prev
+        self.rel_dim = rel_dim
+        self.mp_dim = mp_dim
+        self.delta_dim = delta_dim
+
+        self.classifier = nn.Linear(prev, n_classes)
+        self.rel_proj = nn.Identity() if prev == rel_dim else nn.Linear(prev, rel_dim, bias=False)
+        self.struct_classifier = nn.Linear(rel_dim, n_classes)
+        self.mp_proj = nn.Identity() if prev == mp_dim else nn.Linear(prev, mp_dim, bias=False)
+        self.tail_proj = nn.Identity() if prev == mp_dim else nn.Linear(prev, mp_dim, bias=False)
+        self.delta_proj = nn.Identity() if mp_dim == delta_dim else nn.Linear(mp_dim, delta_dim, bias=False)
+        self.beta_mlp = nn.Sequential(
+            nn.Linear(mp_dim, beta_hidden),
+            nn.Tanh(),
+            nn.Linear(beta_hidden, 1),
+        )
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        h = x
+        for block in self.blocks:
+            h = block(h)
+        return h
+
+    def forward_all(self, x: torch.Tensor):
+        feats = self.forward_features(x)
+        logits = self.classifier(feats)
+        rel_base = self.rel_proj(feats) if not isinstance(self.rel_proj, nn.Identity) else feats
+        mp_base = self.mp_proj(feats) if not isinstance(self.mp_proj, nn.Identity) else feats
+        tail = self.tail_proj(feats) if not isinstance(self.tail_proj, nn.Identity) else feats
+        return logits, feats, rel_base, mp_base, tail
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        logits, *_ = self.forward_all(x)
+        return logits
+
+    def structural_logits(self, rel_student: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]],
+                           category: str) -> Optional[torch.Tensor]:
+        collected = []
+        for et, tensors in rel_student.items():
+            if et[2] != category:
+                continue
+            collected.append(tensors['dst'])
+        if not collected:
+            return None
+        stacked = torch.stack(collected, dim=0).mean(dim=0)
+        return self.struct_classifier(stacked)
+
+    def meta_path_attention(self, mp_embs: Dict[str, torch.Tensor], keys: List[str]) -> torch.Tensor:
+        if not mp_embs:
+            raise ValueError("meta_path_attention requires non-empty embeddings")
+        device = next(self.beta_mlp.parameters()).device
+        any_emb = next(iter(mp_embs.values()))
+        num_nodes = any_emb.size(0)
+        logits = []
+        for key in keys:
+            if key in mp_embs:
+                logits.append(self.beta_mlp(mp_embs[key]).squeeze(-1))
+            else:
+                logits.append(torch.full((num_nodes,), -1e9, device=device))
+        beta_logits = torch.stack(logits, dim=1)
+        return F.softmax(beta_logits, dim=1)
 
 
 class RelKDAdapter(nn.Module):
@@ -267,8 +334,14 @@ class RelKDAdapter(nn.Module):
 
     def __init__(self, node_dims: Dict[str, int], d_rel: int):
         super().__init__()
-        self.proj = nn.ModuleDict({nt: nn.Linear(node_dims[nt], d_rel, bias=False)
-                                   for nt in node_dims})
+        self.d_rel = d_rel
+        proj = {}
+        for nt, dim in node_dims.items():
+            if dim == d_rel:
+                proj[nt] = nn.Identity()
+            else:
+                proj[nt] = nn.Linear(dim, d_rel, bias=False)
+        self.proj = nn.ModuleDict(proj)
 
     @torch.no_grad()
     def _build_adj(self, hetero: HeteroData, et: Tuple[str, str, str], device: torch.device):
@@ -293,7 +366,8 @@ class RelKDAdapter(nn.Module):
         x_proj = {}
         for nt in hetero.node_types:
             feats = node_overrides[nt] if node_overrides and nt in node_overrides else hetero[nt].x
-            x_proj[nt] = self.proj[nt](feats.to(device))
+            proj = self.proj[nt]
+            x_proj[nt] = proj(feats.to(device)) if not isinstance(proj, nn.Identity) else feats.to(device)
 
         rel_embs: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]] = {}
         for et in etypes:
@@ -314,23 +388,33 @@ class MetaPathAdapter(nn.Module):
                  d_mp: int,
                  ops_template: Dict[str, Dict[str, List[SparseTensor]]]):
         super().__init__()
-        self.proj = nn.ModuleDict({nt: nn.Linear(node_dims[nt], d_mp, bias=False)
-                                   for nt in node_dims})
+        self.proj = nn.ModuleDict()
         self.metapath_keys = [metapath_to_str(mp) for mp in metapaths]
         self.metapaths = {metapath_to_str(mp): mp for mp in metapaths}
         self.ops_template = ops_template
         self.d_mp = d_mp
+        for nt, dim in node_dims.items():
+            if dim == d_mp:
+                self.proj[nt] = nn.Identity()
+            else:
+                self.proj[nt] = nn.Linear(dim, d_mp, bias=False)
 
     def forward(self, hetero: HeteroData,
                 node_overrides: Optional[Dict[str, torch.Tensor]] = None,
                 device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
         if len(self.metapath_keys) == 0:
             return {}
-        device = device or next(iter(self.proj.values())).weight.device
+        if device is None:
+            example_proj = next(iter(self.proj.values()))
+            if isinstance(example_proj, nn.Identity):
+                device = hetero[hetero.node_types[0]].x.device
+            else:
+                device = example_proj.weight.device
         x_proj = {}
         for nt in hetero.node_types:
             feats = node_overrides[nt] if node_overrides and nt in node_overrides else hetero[nt].x
-            x_proj[nt] = self.proj[nt](feats.to(device))
+            proj = self.proj[nt]
+            x_proj[nt] = proj(feats.to(device)) if not isinstance(proj, nn.Identity) else feats.to(device)
 
         mp_embs: Dict[str, torch.Tensor] = {}
         for key in self.metapath_keys:
@@ -342,42 +426,6 @@ class MetaPathAdapter(nn.Module):
                 z = op_dev.matmul(z)
             mp_embs[key] = z
         return mp_embs
-
-
-class SemanticHead(nn.Module):
-    """Lightweight semantic attention head to predict meta-path importance."""
-
-    def __init__(self, d_mp: int, hidden: int = 128):
-        super().__init__()
-        self.lin1 = nn.Linear(d_mp, hidden)
-        self.lin2 = nn.Linear(hidden, hidden)
-        self.attn = nn.Linear(hidden, 1)
-        self.dropout = nn.Dropout(0.1)
-        
-        # 大幅改进初始化 - 使用更大的初始化值
-        nn.init.normal_(self.lin1.weight, mean=0.0, std=0.1)
-        nn.init.normal_(self.lin2.weight, mean=0.0, std=0.1)
-        nn.init.normal_(self.attn.weight, mean=0.0, std=0.1)
-        nn.init.zeros_(self.lin1.bias)
-        nn.init.zeros_(self.lin2.bias)
-        nn.init.zeros_(self.attn.bias)
-
-    def forward(self, mp_embs: List[torch.Tensor]) -> torch.Tensor:
-        if len(mp_embs) == 0:
-            raise ValueError("SemanticHead requires at least one meta-path embedding")
-        stacked = torch.stack(mp_embs, dim=1)  # [N, M, d]
-        
-        # 改进的前向传播 - 使用更强的非线性
-        h1 = torch.tanh(self.lin1(stacked))  # 使用tanh获得更强的非线性
-        h1 = self.dropout(h1)
-        h2 = torch.tanh(self.lin2(h1))
-        h2 = self.dropout(h2)
-        scores = self.attn(h2).squeeze(-1)
-        
-        # 使用更小的温度参数使softmax更敏感
-        temperature = 1  # 进一步减小温度
-        beta = torch.softmax(scores / temperature, dim=1)
-        return beta
 # =========================
 # Teacher-R: RSAGE (unchanged)
 # =========================
@@ -759,7 +807,17 @@ class MetaPathTeacher(nn.Module):
 
 def _edge_relpos(emb_dst: torch.Tensor, emb_src_in: torch.Tensor, ei: torch.Tensor) -> torch.Tensor:
     src, dst = ei[0].long(), ei[1].long()
-    return emb_dst[dst] - emb_src_in[src]
+    # Normalize embeddings to control scale; compute features on unit vectors
+    x_dst = emb_dst[dst]
+    x_src = emb_src_in[src]
+    x_dst_n = F.normalize(x_dst, dim=-1)
+    x_src_n = F.normalize(x_src, dim=-1)
+    # Cosine similarity in [-1, 1]
+    cosine_sim = F.cosine_similarity(x_dst_n, x_src_n, dim=-1).unsqueeze(-1)  # [E, 1]
+    # Euclidean distance between unit vectors in [0, 2]; divide by 2 => [0, 1]
+    euclidean = torch.norm(x_dst_n - x_src_n, p=2, dim=-1, keepdim=True) / 2.0  # [E, 1]
+    # Return per-edge features: [cosine_similarity, normalized_euclidean_distance]
+    return torch.cat([cosine_sim, euclidean], dim=-1)
 
 
 def relation_relative_pos_l2(taps_teacher: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]],
@@ -791,8 +849,8 @@ def relation_relative_pos_l2(taps_teacher: Dict[Tuple[str, str, str], Dict[str, 
         rel_t = _edge_relpos(emb_t_dst, emb_t_src, ei)
         rel_s = _edge_relpos(emb_s_dst, emb_s_src, ei)
         l2 = (rel_t - rel_s).pow(2).sum(dim=-1) / rel_t.size(1)
-        if reliability is not None:
-            l2 = l2 * reliability[ei[1].long()]
+        #if reliability is not None:
+        #    l2 = l2 * reliability[ei[1].long()]
         losses.append(l2.mean())
     if not losses:
         return torch.tensor(0.0, device=device)
@@ -943,30 +1001,6 @@ def metapath2vec_category_embeddings(hetero: HeteroData,
         torch.save(z, cache_path)
         print(f"[MP2V] Saved embeddings to {cache_path}")
     return z
-class RelationStructuralHead(nn.Module):
-    def __init__(self,
-                 relations: List[Tuple[str, str, str]],
-                 category: str,
-                 rel_dim: int,
-                 num_classes: int):
-        super().__init__()
-        self.category = category
-        self.rel_list = [et for et in relations if et[2] == category]
-        self.rel_heads = nn.ModuleDict({self._key(et): nn.Linear(rel_dim, num_classes, bias=False)
-                                        for et in self.rel_list})
-
-    @staticmethod
-    def _key(et: Tuple[str, str, str]) -> str:
-        return f"{et[0]}::{et[1]}::{et[2]}"
-
-    def forward(self, rel_embs: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]]) -> Optional[torch.Tensor]:
-        logits = None
-        for et in self.rel_list:
-            if et not in rel_embs:
-                continue
-            contrib = self.rel_heads[self._key(et)](rel_embs[et]['dst'])
-            logits = contrib if logits is None else logits + contrib
-        return logits
 # =========================
 # Training helpers
 # =========================
@@ -1097,8 +1131,7 @@ def train_student_dual_kd(args,
     node_dims = {nt: hetero[nt].x.size(1) for nt in hetero.node_types}
 
     base_feats = hetero[category].x.to(device)
-    student_feats = base_feats
-    mp2v_feats = None
+    student_inputs = base_feats
     if args.use_positional_encoding:
         mp2v_feats = metapath2vec_category_embeddings(
             hetero=hetero,
@@ -1113,27 +1146,30 @@ def train_student_dual_kd(args,
             cache_dir=args.mp_cache_dir,
             seed=args.seed,
         )
-        student_feats = torch.cat([student_feats, mp2v_feats], dim=-1)
+        student_inputs = torch.cat([student_inputs, mp2v_feats], dim=-1)
 
-    student = MLPClassifier(d_in=student_feats.size(1),
-                            n_classes=num_classes,
-                            hidden=args.student_hidden,
-                            num_layers=args.student_layers,
-                            dropout=args.student_dropout).to(device)
-    # 修正：开启位置编码后，category 节点维度已改变，需要更新 node_dims
-    node_dims[category] = student_feats.size(1)
+    student = GraphFreeStudent(d_in=student_inputs.size(1),
+                               n_classes=num_classes,
+                               hidden=args.student_hidden,
+                               num_layers=args.student_layers,
+                               dropout=args.student_dropout,
+                               rel_dim=args.rel_dim,
+                               mp_dim=args.mp_dim,
+                               delta_dim=args.delta_dim,
+                               beta_hidden=args.mp_beta_hidden).to(device)
 
-    rel_adapter = RelKDAdapter(node_dims, d_rel=args.rel_dim).to(device)
-    mp_adapter = MetaPathAdapter(node_dims, metapaths, d_mp=args.mp_dim, ops_template=ops_template).to(device)
-    semantic_head = SemanticHead(d_mp=args.mp_dim, hidden=args.mp_beta_hidden).to(device)
-    struct_head = RelationStructuralHead(list(hetero.edge_types), category,
-                                         rel_dim=args.rel_dim, num_classes=num_classes).to(device)
+    use_direct_aux = not getattr(args, 'no_direct_aux', False)
+    print(f"use_direct_aux: {use_direct_aux}")
 
-    tail_student_align = nn.Linear(student_feats.size(1), args.mp_dim, bias=False).to(device)
+    node_dims_rel = dict(node_dims)
+    node_dims_rel[category] = student.rel_dim
+    rel_adapter = RelKDAdapter(node_dims_rel, d_rel=student.rel_dim).to(device)
+
+    node_dims_mp = dict(node_dims)
+    node_dims_mp[category] = student.mp_dim
+    mp_adapter = MetaPathAdapter(node_dims_mp, metapaths, d_mp=student.mp_dim, ops_template=ops_template).to(device)
+
     teacher_delta_proj = nn.Linear(args.han_hidden, args.delta_dim, bias=False).to(device)
-    student_delta_proj = nn.Linear(args.mp_dim, args.delta_dim, bias=False).to(device)
-
-    # 优化器将在教师 taps 与投影器构建完成后创建
 
     hetero_device = hetero.to(device)
 
@@ -1160,21 +1196,23 @@ def train_student_dual_kd(args,
         beta_teacher = beta_teacher.detach()
         alpha_maps = {k: v.coalesce() for k, v in alpha_maps.items()}
 
-    # 在拿到 taps 后，再构建教师侧投影与优化器，避免未绑定变量
     rel_t_dst_proj: Optional[nn.Module] = None
     rel_t_src_proj: Optional[nn.Module] = None
     if taps and len(taps) > 0:
         any_et = next(iter(taps))
         t_dst_dim = taps[any_et]['dst'].size(1)
         t_src_dim = taps[any_et]['src_in'].size(1)
-        rel_t_dst_proj = (nn.Linear(t_dst_dim, args.rel_dim, bias=False).to(device)
-                          if t_dst_dim != args.rel_dim else nn.Identity().to(device))
-        rel_t_src_proj = (nn.Linear(t_src_dim, args.rel_dim, bias=False).to(device)
-                          if t_src_dim != args.rel_dim else nn.Identity().to(device))
-    
-    params = list(student.parameters()) + list(rel_adapter.parameters()) + list(mp_adapter.parameters()) + \
-        list(semantic_head.parameters()) + list(struct_head.parameters()) + \
-        list(tail_student_align.parameters()) + list(teacher_delta_proj.parameters()) + list(student_delta_proj.parameters())
+        rel_t_dst_proj = (nn.Linear(t_dst_dim, student.rel_dim, bias=False).to(device)
+                          if t_dst_dim != student.rel_dim else nn.Identity().to(device))
+        rel_t_src_proj = (nn.Linear(t_src_dim, student.rel_dim, bias=False).to(device)
+                          if t_src_dim != student.rel_dim else nn.Identity().to(device))
+
+    params = (
+        list(student.parameters())
+        + list(rel_adapter.parameters())
+        + list(mp_adapter.parameters())
+        + list(teacher_delta_proj.parameters())
+    )
     if rel_t_dst_proj is not None and not isinstance(rel_t_dst_proj, nn.Identity):
         params += list(rel_t_dst_proj.parameters())
     if rel_t_src_proj is not None and not isinstance(rel_t_src_proj, nn.Identity):
@@ -1188,16 +1226,24 @@ def train_student_dual_kd(args,
     best_state, best_val, patience = None, -1.0, 0
     for epoch in range(1, args.student_epochs + 1):
         student.train()
-        logits_s = student(student_feats)
+        logits_s, student_hidden, rel_base, mp_base, tail_student = student.forward_all(student_inputs)
         ce_loss = F.cross_entropy(logits_s[idx_train], y[idx_train]) * args.ce_coeff
 
         kd_rel = kd_kl(logits_s, logits_r, T=args.kd_T, reduce=False)
         kd_h = kd_kl(logits_s, logits_h, T=args.kd_T, reduce=False)
         kd_loss = ((gamma * rho_r * kd_rel) + ((1 - gamma) * rho_h * kd_h)).mean() * args.kd_coeff
+ 
+        #kd_loss = kd_kl(logits_s, logits_r, T=args.kd_T, reduce=True) 
 
-        overrides = {category: student_feats}
-        rel_student = rel_adapter(hetero, list(hetero.edge_types), node_overrides=overrides, device=device)
-        # 对教师 taps 做按类型的线性投影以匹配 student 的 rel_dim
+        # 修复梯度传递问题：确保辅助损失能够训练MLP学生模型
+        # 移除detach()调用，让所有损失都能向学生模型传递梯度
+        rel_base_aux = rel_base  # 保持梯度连接
+        mp_base_aux = mp_base    # 保持梯度连接
+        tail_student_aux = tail_student  # 保持梯度连接
+
+        rel_overrides = {category: rel_base_aux}
+        rel_student = rel_adapter(hetero, list(hetero.edge_types), node_overrides=rel_overrides, device=device)
+
         taps_projected = {}
         for et, mm in taps.items():
             t_dst = mm['dst']
@@ -1216,16 +1262,15 @@ def train_student_dual_kd(args,
                                             projector_t=None,
                                             projector_s=None) * args.lambda_rel_pos
 
-        struct_logits = struct_head(rel_student)
+        struct_logits = student.structural_logits(rel_student, category)
         struct_loss = torch.tensor(0.0, device=device)
         if struct_logits is not None and args.lambda_rel_struct > 0:
             struct_loss = F.cross_entropy(struct_logits[idx_train], y[idx_train]) * args.lambda_rel_struct
 
-        mp_student_embs = mp_adapter(hetero, node_overrides=overrides, device=device)
-        beta_student = semantic_head([mp_student_embs[k] for k in mp_adapter.metapath_keys])
+        mp_overrides = {category: mp_base_aux}
+        mp_student_embs = mp_adapter(hetero, node_overrides=mp_overrides, device=device)
+        beta_student = student.meta_path_attention(mp_student_embs, mp_adapter.metapath_keys)
 
-
-        tail_student = tail_student_align(student_feats)
         mp_feat_loss = meta_path_feature_loss(mp_teacher_embs,
                                               mp_student_embs,
                                               beta_teacher,
@@ -1235,9 +1280,9 @@ def train_student_dual_kd(args,
         mp_relpos = meta_path_relpos_loss(mp_teacher_embs,
                                           mp_student_embs,
                                           tail_teacher,
-                                          tail_student,
+                                          tail_student_aux,
                                           teacher_delta_proj,
-                                          student_delta_proj,
+                                          student.delta_proj,
                                           rho_h,
                                           mp_adapter.metapath_keys) * args.lambda_mp_relpos
 
@@ -1247,14 +1292,11 @@ def train_student_dual_kd(args,
         optimizer.zero_grad()
         loss.backward()
         
-        # 梯度裁剪，防止梯度爆炸 - 放宽限制
-        torch.nn.utils.clip_grad_norm_(semantic_head.parameters(), max_norm=5.0)
-        
         optimizer.step()
 
         student.eval()
         with torch.no_grad():
-            logits_eval = student(student_feats)
+            logits_eval = student(student_inputs)
             val_acc = accuracy(logits_eval, y, idx_val)
             train_acc = accuracy(logits_eval, y, idx_train)
             test_acc = accuracy(logits_eval, y, idx_test)
@@ -1273,10 +1315,11 @@ def train_student_dual_kd(args,
     if best_state is not None:
         student.load_state_dict(best_state)
     student.eval()
-    logits_final = student(student_feats)
+    logits_final = student(student_inputs)
     test_acc = accuracy(logits_final, y, idx_test)
     print(f"[Student] Final(best) | val {best_val:.4f} | test {test_acc:.4f}")
-    return student, student_feats
+    return student, student_inputs
+
 # =========================
 # CLI
 # =========================
@@ -1301,9 +1344,9 @@ def main():
     parser.add_argument('--han_hidden', type=int, default=128)
     parser.add_argument('--han_semantic_hidden', type=int, default=128)
     parser.add_argument('--han_dropout', type=float, default=0.5)
-    parser.add_argument('--han_heads', type=int, default=8)
-    parser.add_argument('--han_lr', type=float, default=0.001)
-    parser.add_argument('--han_wd', type=float, default=0.001)
+    parser.add_argument('--han_heads', type=int, default=4)
+    parser.add_argument('--han_lr', type=float, default=0.01)
+    parser.add_argument('--han_wd', type=float, default=0.0001)
     parser.add_argument('--han_epochs', type=int, default=300)
     parser.add_argument('--han_patience', type=int, default=40)
 
@@ -1315,17 +1358,19 @@ def main():
     parser.add_argument('--student_hidden', type=int, default=128)
     parser.add_argument('--student_layers', type=int, default=2)
     parser.add_argument('--student_dropout', type=float, default=0.5)
-    parser.add_argument('--student_lr', type=float, default=0.01)
-    parser.add_argument('--student_wd', type=float, default=0.0005)
+    parser.add_argument('--student_lr', type=float, default=0.001)
+    parser.add_argument('--student_wd', type=float, default=0.0001)
     parser.add_argument('--student_epochs', type=int, default=1000)
-    parser.add_argument('--student_patience', type=int, default=60)
+    parser.add_argument('--student_patience', type=int, default=1000)
+    parser.add_argument('--no_direct_aux', action='store_true',
+                        help='Detach auxiliary losses from the student MLP for ablation/baseline comparisons.')
 
     # KD weights
     parser.add_argument('--kd_T', type=float, default=1.0)
-    parser.add_argument('--ce_coeff', type=float, default=0.0)
-    parser.add_argument('--kd_coeff', type=float, default=0)
+    parser.add_argument('--ce_coeff', type=float, default=1)
+    parser.add_argument('--kd_coeff', type=float, default= 0)
     parser.add_argument('--lambda_rel_pos', type=float, default=1)
-    parser.add_argument('--lambda_rel_struct', type=float, default=1)
+    parser.add_argument('--lambda_rel_struct', type=float, default=0)
     parser.add_argument('--lambda_mp_feat', type=float, default=0)
     parser.add_argument('--lambda_mp_relpos', type=float, default=0)
     parser.add_argument('--lambda_mp_beta', type=float, default=0)  # 大幅增加beta损失权重
@@ -1389,7 +1434,7 @@ def main():
     han_teacher = train_metapath_teacher(args, hetero, category, y, idx_train, idx_val, idx_test,
                                          typed_metapaths, ops_template, device)
 
-    student, student_feats = train_student_dual_kd(args, hetero, category, y,
+    student, student_inputs = train_student_dual_kd(args, hetero, category, y,
                                                    idx_train, idx_val, idx_test,
                                                    device, rsage_teacher, han_teacher,
                                                    typed_metapaths, ops_template)
@@ -1409,7 +1454,7 @@ def main():
         va_h = accuracy(logits_h, y, idx_val)
         te_h = accuracy(logits_h, y, idx_test)
         print(f"Meta teacher   | train {tr_h:.4f} | val {va_h:.4f} | test {te_h:.4f}")
-        logits_s = student(student_feats)
+        logits_s = student(student_inputs)
         tr_s = accuracy(logits_s, y, idx_train)
         va_s = accuracy(logits_s, y, idx_val)
         te_s = accuracy(logits_s, y, idx_test)
@@ -1429,7 +1474,7 @@ def main():
         return han_teacher(hetero_device)
     
     def student_forward():
-        return student(student_feats)
+        return student(student_inputs)
     
     mean_r, std_r = _benchmark_forward(rsage_forward, warmup, runs, device)
     mean_h, std_h = _benchmark_forward(han_forward, warmup, runs, device)
