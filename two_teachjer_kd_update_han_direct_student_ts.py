@@ -80,6 +80,19 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # 强化确定性：启用确定性算法并设置CUBLAS工作区（需重启影响最小）
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception:
+        pass
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':16:8')
+    os.environ.setdefault('PYTHONHASHSEED', str(seed))
+    # 关闭TF32以提升可重复性
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    except Exception:
+        pass
     print(f"[INFO] Seed set to {seed}")
 
 
@@ -430,6 +443,51 @@ class MetaPathAdapter(nn.Module):
                 z = op_dev.matmul(z)
             mp_embs[key] = z
         return mp_embs
+ 
+# =========================
+# Student meta-path embeddings (direct, no adapter)
+# =========================
+
+def build_student_metapath_embs_direct(
+    hetero: HeteroData,
+    ops_template: Dict[str, Dict[str, List[SparseTensor]]],
+    mp_base: torch.Tensor,
+    category: str,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Build student meta-path embeddings using only student's category features (mp_base),
+    without any per-node-type adapter. For non-category node types, construct features by
+    size-aligning mp_base via truncate/pad, then propagate along norm_ops to the category.
+    """
+    # Prepare per-node-type features by reusing category features with size alignment
+    x_proj: Dict[str, torch.Tensor] = {}
+    cat_feats = mp_base.to(device)
+    cat_num = hetero[category].num_nodes
+    for nt in hetero.node_types:
+        n_nodes = hetero[nt].num_nodes
+        if nt == category:
+            x_proj[nt] = cat_feats
+        else:
+            if n_nodes == cat_num:
+                x_proj[nt] = cat_feats
+            elif n_nodes < cat_num:
+                x_proj[nt] = cat_feats[:n_nodes]
+            else:
+                pad = torch.zeros(n_nodes - cat_num, cat_feats.size(1), device=cat_feats.device, dtype=cat_feats.dtype)
+                x_proj[nt] = torch.cat([cat_feats, pad], dim=0)
+
+    # Compute mp embeddings by chaining normalized operators
+    mp_embs: Dict[str, torch.Tensor] = {}
+    for key, info in ops_template.items():
+        typed = info['typed']  # List[Tuple[src, rel, dst]]
+        if not typed:
+            continue
+        start_nt = typed[0][0]
+        z = x_proj[start_nt]
+        for op in info['norm_ops']:
+            z = op.to(device).matmul(z)
+        mp_embs[key] = z
+    return mp_embs
 # =========================
 # Teacher-R: RSAGE (unchanged)
 # =========================
@@ -806,7 +864,7 @@ class MetaPathTeacher(nn.Module):
 
     def project_student_delta(self, delta: torch.Tensor) -> torch.Tensor:
         return self.delta_projector_student(delta)# =========================
-# Loss components
+# Loss componlp
 # =========================
 
 def _edge_relpos(emb_dst: torch.Tensor, emb_src_in: torch.Tensor, ei: torch.Tensor) -> torch.Tensor:
@@ -1076,6 +1134,39 @@ def metapath2vec_category_embeddings(hetero: HeteroData,
         torch.save(z, cache_path)
         print(f"[MP2V] Saved embeddings to {cache_path}")
     return z
+
+# =========================
+# Teacher save/load helpers
+# =========================
+
+def _teacher_paths(base_dir: str, dataset: str, seed: int) -> Tuple[Path, Path, Path]:
+    root = Path(base_dir) / dataset / f"seed_{seed}"
+    rsage_p = root / 'rsage.pt'
+    han_p = root / 'han.pt'
+    return root, rsage_p, han_p
+
+def save_teachers(base_dir: str, dataset: str, seed: int,
+                  rsage_teacher: nn.Module, han_teacher: nn.Module) -> None:
+    root, rsage_p, han_p = _teacher_paths(base_dir, dataset, seed)
+    root.mkdir(parents=True, exist_ok=True)
+    torch.save(rsage_teacher.state_dict(), rsage_p)
+    torch.save(han_teacher.state_dict(), han_p)
+    print(f"[TeacherCache] Saved RSAGE -> {rsage_p}")
+    print(f"[TeacherCache] Saved HAN   -> {han_p}")
+
+def load_teachers_if_available(base_dir: str, dataset: str, seed: int,
+                               device: torch.device,
+                               build_fn: Tuple) -> Tuple[nn.Module, nn.Module, bool]:
+    """Return (rsage, han, loaded_flag). build_fn is a function that returns fresh (rsage, han)."""
+    root, rsage_p, han_p = _teacher_paths(base_dir, dataset, seed)
+    if rsage_p.exists() and han_p.exists():
+        print(f"[TeacherCache] Loading teachers from {root}")
+        rsage, han = build_fn()
+        rsage.load_state_dict(torch.load(rsage_p, map_location=device))
+        han.load_state_dict(torch.load(han_p, map_location=device))
+        rsage.eval(); han.eval()
+        return rsage, han, True
+    return None, None, False
 # =========================
 # Training helpers
 # =========================
@@ -1241,9 +1332,7 @@ def train_student_dual_kd(args,
     # node_dims_rel[category] = student.rel_dim
     # rel_adapter = RelKDAdapter(node_dims_rel, d_rel=student.rel_dim).to(device)
 
-    node_dims_mp = dict(node_dims)
-    node_dims_mp[category] = student.mp_dim
-    mp_adapter = MetaPathAdapter(node_dims_mp, metapaths, d_mp=student.mp_dim, ops_template=ops_template).to(device)
+    # 移除Adapter：改为直接用学生特征构造元路径表征
 
     teacher_delta_proj = nn.Linear(args.han_hidden, args.delta_dim, bias=False).to(device)
 
@@ -1285,7 +1374,6 @@ def train_student_dual_kd(args,
 
     params = (
         list(student.parameters())
-        + list(mp_adapter.parameters())
         + list(teacher_delta_proj.parameters())
     )
     if rel_t_dst_proj is not None and not isinstance(rel_t_dst_proj, nn.Identity):
@@ -1389,15 +1477,21 @@ def train_student_dual_kd(args,
         if struct_logits is not None and args.lambda_rel_struct > 0:
             struct_loss = F.cross_entropy(struct_logits[idx_train], y[idx_train]) * args.lambda_rel_struct
 
-        mp_overrides = {category: mp_base_aux}
-        mp_student_embs = mp_adapter(hetero, node_overrides=mp_overrides, device=device)
-        beta_student = student.meta_path_attention(mp_student_embs, mp_adapter.metapath_keys)
+        mp_student_embs = build_student_metapath_embs_direct(
+            hetero=hetero,
+            ops_template=ops_template,
+            mp_base=mp_base_aux,
+            category=category,
+            device=device,
+        )
+        mp_keys = list(mp_student_embs.keys())
+        beta_student = student.meta_path_attention(mp_student_embs, mp_keys)
 
         mp_feat_loss = meta_path_feature_loss(mp_teacher_embs,
                                               mp_student_embs,
                                               beta_teacher,
                                               rho_h,
-                                              mp_adapter.metapath_keys) * args.lambda_mp_feat
+                                              mp_keys) * args.lambda_mp_feat
 
         mp_relpos = meta_path_relpos_loss(mp_teacher_embs,
                                           mp_student_embs,
@@ -1406,7 +1500,7 @@ def train_student_dual_kd(args,
                                           teacher_delta_proj,
                                           student.delta_proj,
                                           rho_h,
-                                          mp_adapter.metapath_keys) * args.lambda_mp_relpos
+                                          mp_keys) * args.lambda_mp_relpos
 
         mp_beta = meta_path_beta_loss(beta_teacher, beta_student, rho_h) * args.lambda_mp_beta
 
@@ -1451,6 +1545,16 @@ def main():
     parser.add_argument('-d', '--dataset', type=str, default='TMDB', choices=['TMDB', 'ArXiv', 'DBLP', 'IMDB', 'AMINER'])
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--num_exp', type=int, default=1,
+                        help='重复实验次数；>1 时将多次运行并输出平均±标准差报告')
+    parser.add_argument('--teacher_cache_dir', type=str, default='./teachers',
+                        help='教师模型缓存目录：teachers/<dataset>/seed_<seed>/{rsage.pt,han.pt}')
+    parser.add_argument('--no_reuse_teacher', action='store_true',
+                        help='不复用本地缓存教师，每次都重新训练并覆盖保存')
+    parser.add_argument('--mode', type=str, default='full', choices=['full', 'rsage_only', 'han_only'],
+                        help='运行模式：full 训练教师+学生；rsage_only 仅训练并保存RSAGE；han_only 仅训练并保存HAN')
+    parser.add_argument('--log_csv', type=str, default='./runs.csv',
+                        help='full模式下将结果追加记录到此CSV（若不存在则创建）')
 
     # teacher RSAGE
     parser.add_argument('--teacher_hidden', type=int, default=128)
@@ -1491,7 +1595,7 @@ def main():
     parser.add_argument('--kd_T', type=float, default=1.0)
     parser.add_argument('--ce_coeff', type=float, default=0)
     parser.add_argument('--kd_coeff', type=float, default= 1)
-    parser.add_argument('--lambda_rel_pos', type=float, default=0)
+    parser.add_argument('--lambda_rel_pos', type=float, default=1)
     parser.add_argument('--lambda_rel_struct', type=float, default=0)
     parser.add_argument('--lambda_mp_feat', type=float, default=0)
     parser.add_argument('--lambda_mp_relpos', type=float, default=0)
@@ -1517,15 +1621,17 @@ def main():
 
 
     args = parser.parse_args()
+
+    # 多次实验：固定老师一次，学生可多次以不同seed重复
+    num_exp = max(1, int(args.num_exp))
+
+    # 先初始化一次数据、老师与静态算子
     set_seed(args.seed)
-
     device = torch.device(f'cuda:{args.gpu_id}' if args.gpu_id >= 0 and torch.cuda.is_available() else 'cpu')
-
     hetero, splits, gen_node_feats, metapaths_rel = load_data(dataset=args.dataset, return_mp=True)
     hetero = gen_node_feats(hetero)
     hetero.dataset_name = args.dataset
     category = hetero.category
-
     idx_train, idx_val, idx_test = [idx.to(device) for idx in splits]
     y = hetero[category].y.long().to(device)
 
@@ -1538,12 +1644,9 @@ def main():
     elif metapaths_rel:
         rel_sequences = metapaths_rel
 
-    # 支持两种格式：
-    # 1) 关系名序列（['directed_by','directs']）→ 需要解析
-    # 2) 类型化三元组序列（[('author','to','paper'), ...]）→ 直接使用
     if rel_sequences and isinstance(rel_sequences[0], (list, tuple)) and len(rel_sequences[0]) > 0 \
        and isinstance(rel_sequences[0][0], (list, tuple)) and len(rel_sequences[0][0]) == 3:
-        typed_metapaths = rel_sequences  # already typed
+        typed_metapaths = rel_sequences
     else:
         typed_metapaths = parse_metapath_name_sequences(hetero, category, rel_sequences)
         typed_metapaths = ensure_metapaths_to_category(typed_metapaths, category)
@@ -1552,56 +1655,205 @@ def main():
 
     ops_template = build_metapath_operators(hetero, typed_metapaths, device=device)
 
-    rsage_teacher = train_rsage_teacher(args, hetero, category, y, idx_train, idx_val, idx_test, device)
-    han_teacher = train_metapath_teacher(args, hetero, category, y, idx_train, idx_val, idx_test,
-                                         typed_metapaths, ops_template, device)
+    # 支持教师缓存：每个实验种子都对应一套教师；可复用或重训
+    def build_fresh_teachers():
+        rs = train_rsage_teacher(args, hetero, category, y, idx_train, idx_val, idx_test, device)
+        hn = train_metapath_teacher(args, hetero, category, y, idx_train, idx_val, idx_test,
+                                    typed_metapaths, ops_template, device)
+        return rs, hn
 
-    student, student_inputs = train_student_dual_kd(args, hetero, category, y,
-                                                   idx_train, idx_val, idx_test,
-                                                   device, rsage_teacher, han_teacher,
-                                                   typed_metapaths, ops_template)
+    def build_empty_teachers():
+        # Instantiate RSAGE without training
+        node_dims_local = {nt: hetero[nt].x.size(1) for nt in hetero.node_types}
+        rs = RSAGE_Hetero(
+            etypes=list(hetero.edge_types),
+            in_dim=node_dims_local[category],
+            hid_dim=args.teacher_hidden,
+            num_classes=int(y.max().item()) + 1,
+            category=category,
+            num_layers=args.teacher_layers,
+            dropout=args.teacher_dropout,
+            norm_type='none',
+            node_type_dims=node_dims_local,
+        ).to(device)
+        # Instantiate HAN teacher without training
+        hn = MetaPathTeacher(
+            node_dims=node_dims_local,
+            category=category,
+            metapaths=typed_metapaths,
+            ops_template=ops_template,
+            d_hid=args.han_hidden,
+            num_classes=int(y.max().item()) + 1,
+            semantic_hidden=args.han_semantic_hidden,
+            dropout=args.han_dropout,
+            heads=args.han_heads,
+        ).to(device)
+        hn.prepare_meta_graph(hetero)
+        return rs, hn
 
+    # rsage_only 模式：只训练并保存 RSAGE 教师
+    if args.mode == 'rsage_only':
+        exp_seed = args.seed
+        set_seed(exp_seed)
+        rsage_teacher = train_rsage_teacher(args, hetero, category, y, idx_train, idx_val, idx_test, device)
+        # 加载/构建一个空的HAN，只是为了复用保存路径结构
+        _, _, han_teacher = None, None, None
+        node_dims_local = {nt: hetero[nt].x.size(1) for nt in hetero.node_types}
+        han_teacher = MetaPathTeacher(
+            node_dims=node_dims_local, category=category, metapaths=typed_metapaths,
+            ops_template=ops_template, d_hid=args.han_hidden, num_classes=int(y.max().item()) + 1,
+            semantic_hidden=args.han_semantic_hidden, dropout=args.han_dropout, heads=args.han_heads,
+        ).to(device)
+        han_teacher.prepare_meta_graph(hetero)
+        save_teachers(args.teacher_cache_dir, args.dataset, exp_seed, rsage_teacher, han_teacher)
+        # 记录RSAGE教师性能到CSV
+        if args.log_csv:
+            import csv
+            hetero_device = hetero.to(device)
+            with torch.no_grad():
+                va_r = accuracy(rsage_teacher(hetero_device), y, idx_val)
+                te_r = accuracy(rsage_teacher(hetero_device), y, idx_test)
+            fields_to_skip = {'gpu_id', 'num_exp', 'teacher_cache_dir', 'no_reuse_teacher'}
+            row = {k: (v if isinstance(v, (int, float, str, bool)) else str(v)) for k, v in vars(args).items() if k not in fields_to_skip}
+            row.update({
+                'mode': 'rsage_only',
+                'rsage_val': f"{va_r:.4f}", 'rsage_test': f"{te_r:.4f}",
+                'seed_used': exp_seed,
+            })
+            cli_keys = [k for k in vars(args).keys() if k not in fields_to_skip]
+            metric_keys = [k for k in row.keys() if k not in cli_keys]
+            fieldnames = cli_keys + metric_keys
+            need_header = not os.path.exists(args.log_csv)
+            with open(args.log_csv, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if need_header:
+                    writer.writeheader()
+                writer.writerow(row)
+        return
+
+    # han_only 模式：只训练并保存 HAN 教师
+    if args.mode == 'han_only':
+        exp_seed = args.seed
+        set_seed(exp_seed)
+        han_teacher = train_metapath_teacher(args, hetero, category, y, idx_train, idx_val, idx_test,
+                                             typed_metapaths, ops_template, device)
+        # 加载/构建一个空的RSAGE，只是为了复用保存路径结构
+        node_dims_local = {nt: hetero[nt].x.size(1) for nt in hetero.node_types}
+        rsage_teacher = RSAGE_Hetero(
+            etypes=list(hetero.edge_types), in_dim=node_dims_local[category], hid_dim=args.teacher_hidden,
+            num_classes=int(y.max().item()) + 1, category=category, num_layers=args.teacher_layers,
+            dropout=args.teacher_dropout, norm_type='none', node_type_dims=node_dims_local,
+        ).to(device)
+        save_teachers(args.teacher_cache_dir, args.dataset, exp_seed, rsage_teacher, han_teacher)
+        # 记录HAN教师性能到CSV
+        if args.log_csv:
+            import csv
+            hetero_device = hetero.to(device)
+            with torch.no_grad():
+                logits_h = han_teacher(hetero_device)
+                va_h = accuracy(logits_h, y, idx_val)
+                te_h = accuracy(logits_h, y, idx_test)
+            fields_to_skip = {'gpu_id', 'num_exp', 'teacher_cache_dir', 'no_reuse_teacher'}
+            row = {k: (v if isinstance(v, (int, float, str, bool)) else str(v)) for k, v in vars(args).items() if k not in fields_to_skip}
+            row.update({
+                'mode': 'han_only',
+                'han_val': f"{va_h:.4f}", 'han_test': f"{te_h:.4f}",
+                'seed_used': exp_seed,
+            })
+            cli_keys = [k for k in vars(args).keys() if k not in fields_to_skip]
+            metric_keys = [k for k in row.keys() if k not in cli_keys]
+            fieldnames = cli_keys + metric_keys
+            need_header = not os.path.exists(args.log_csv)
+            with open(args.log_csv, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if need_header:
+                    writer.writeheader()
+                writer.writerow(row)
+        return
+
+    # 多次学生实验 & 教师也随种子重复/缓存（full 模式）
+    val_scores, test_scores = [], []
+    # 分别记录两位教师
+    rsage_val_scores, rsage_test_scores = [], []
+    han_val_scores, han_test_scores = [], []
+    for k in range(num_exp):
+        exp_seed = args.seed + k
+        set_seed(exp_seed)
+
+        # 教师：优先加载，否则重训并保存（除非指定 no_reuse_teacher）
+        if not args.no_reuse_teacher:
+            rsage_teacher, han_teacher, loaded = load_teachers_if_available(
+                base_dir=args.teacher_cache_dir,
+                dataset=args.dataset,
+                seed=exp_seed,
+                device=device,
+                build_fn=lambda: build_empty_teachers(),
+            )
+            if not loaded:
+                rsage_teacher, han_teacher = build_fresh_teachers()
+                save_teachers(args.teacher_cache_dir, args.dataset, exp_seed, rsage_teacher, han_teacher)
+        else:
+            rsage_teacher, han_teacher = build_fresh_teachers()
+            save_teachers(args.teacher_cache_dir, args.dataset, exp_seed, rsage_teacher, han_teacher)
+
+        # 记录教师表现
+        hetero_device = hetero.to(device)
+        with torch.no_grad():
+            tr_r = accuracy(rsage_teacher(hetero_device), y, idx_train)
+            va_r = accuracy(rsage_teacher(hetero_device), y, idx_val)
+            te_r = accuracy(rsage_teacher(hetero_device), y, idx_test)
+            logits_h = han_teacher(hetero_device)
+            tr_h = accuracy(logits_h, y, idx_train)
+            va_h = accuracy(logits_h, y, idx_val)
+            te_h = accuracy(logits_h, y, idx_test)
+        rsage_val_scores.append(va_r); rsage_test_scores.append(te_r)
+        han_val_scores.append(va_h); han_test_scores.append(te_h)
+
+        # 学生训练
+        student, student_inputs = train_student_dual_kd(
+            args, hetero, category, y,
+            idx_train, idx_val, idx_test,
+            device, rsage_teacher, han_teacher,
+            typed_metapaths, ops_template
+        )
+        student.eval()
+        with torch.no_grad():
+            logits_s = student(student_inputs)
+            va_s = accuracy(logits_s, y, idx_val)
+            te_s = accuracy(logits_s, y, idx_test)
+        val_scores.append(va_s)
+        test_scores.append(te_s)
+
+    # 汇总报告
+    val_mean = float(np.mean(val_scores)); val_std = float(np.std(val_scores))
+    test_mean = float(np.mean(test_scores)); test_std = float(np.std(test_scores))
+    r_val_mean = float(np.mean(rsage_val_scores)); r_val_std = float(np.std(rsage_val_scores))
+    r_test_mean = float(np.mean(rsage_test_scores)); r_test_std = float(np.std(rsage_test_scores))
+    h_val_mean = float(np.mean(han_val_scores)); h_val_std = float(np.std(han_val_scores))
+    h_test_mean = float(np.mean(han_test_scores)); h_test_std = float(np.std(han_test_scores))
     print("\n" + "="*60)
-    print("FINAL SUMMARY")
+    print(f"MULTI-RUN REPORT (n={num_exp})")
+    print(f"RSAGE teacher | val {r_val_mean:.4f} ± {r_val_std:.4f} | test {r_test_mean:.4f} ± {r_test_std:.4f}")
+    print(f"HAN teacher   | val {h_val_mean:.4f} ± {h_val_std:.4f} | test {h_test_mean:.4f} ± {h_test_std:.4f}")
+    print(f"Student (MLP) | val {val_mean:.4f} ± {val_std:.4f} | test {test_mean:.4f} ± {test_std:.4f}")
     print("="*60)
-    rsage_teacher.eval(); han_teacher.eval(); student.eval()
-    hetero_device = hetero.to(device)
-    with torch.no_grad():
-        tr_r = accuracy(rsage_teacher(hetero_device), y, idx_train)
-        va_r = accuracy(rsage_teacher(hetero_device), y, idx_val)
-        te_r = accuracy(rsage_teacher(hetero_device), y, idx_test)
-        print(f"RSAGE teacher  | train {tr_r:.4f} | val {va_r:.4f} | test {te_r:.4f}")
-        logits_h = han_teacher(hetero_device)
-        tr_h = accuracy(logits_h, y, idx_train)
-        va_h = accuracy(logits_h, y, idx_val)
-        te_h = accuracy(logits_h, y, idx_test)
-        print(f"Meta teacher   | train {tr_h:.4f} | val {va_h:.4f} | test {te_h:.4f}")
-        logits_s = student(student_inputs)
-        tr_s = accuracy(logits_s, y, idx_train)
-        va_s = accuracy(logits_s, y, idx_val)
-        te_s = accuracy(logits_s, y, idx_test)
-        print(f"Student (MLP)  | train {tr_s:.4f} | val {va_s:.4f} | test {te_s:.4f}")
 
-    # Inference benchmark
+    # 单次基准（使用最后一次学生）
+    hetero_device = hetero.to(device)
     print("\n" + "="*60)
     print("INFERENCE TIME COMPARISON")
     print("="*60)
     warmup = 3
     runs = 10
-    
     def rsage_forward():
         return rsage_teacher(hetero_device)
-    
     def han_forward():
         return han_teacher(hetero_device)
-    
     def student_forward():
         return student(student_inputs)
-    
     mean_r, std_r = _benchmark_forward(rsage_forward, warmup, runs, device)
     mean_h, std_h = _benchmark_forward(han_forward, warmup, runs, device)
     mean_s, std_s = _benchmark_forward(student_forward, warmup, runs, device)
-    
     print(f"RSAGE Teacher:  {mean_r * 1000:.3f} ± {std_r * 1000:.3f} ms")
     print(f"HAN Teacher:    {mean_h * 1000:.3f} ± {std_h * 1000:.3f} ms")
     print(f"Student (MLP):  {mean_s * 1000:.3f} ± {std_s * 1000:.3f} ms")
@@ -1609,6 +1861,33 @@ def main():
         print(f"Speedup vs RSAGE: {mean_r / mean_s:.2f}x")
         print(f"Speedup vs HAN:   {mean_h / mean_s:.2f}x")
     print("="*60)
+
+    # 追加写入CSV日志（仅在full模式）
+    if args.mode == 'full' and args.log_csv:
+        import csv
+        fields_to_skip = {'gpu_id', 'num_exp', 'teacher_cache_dir', 'no_reuse_teacher'}
+        row = {k: (v if isinstance(v, (int, float, str, bool)) else str(v)) for k, v in vars(args).items() if k not in fields_to_skip}
+        row.update({
+            'val_mean': f"{val_mean:.4f}", 'val_std': f"{val_std:.4f}",
+            'test_mean': f"{test_mean:.4f}", 'test_std': f"{test_std:.4f}",
+            'rsage_val_mean': f"{r_val_mean:.4f}", 'rsage_val_std': f"{r_val_std:.4f}",
+            'rsage_test_mean': f"{r_test_mean:.4f}", 'rsage_test_std': f"{r_test_std:.4f}",
+            'han_val_mean': f"{h_val_mean:.4f}", 'han_val_std': f"{h_val_std:.4f}",
+            'han_test_mean': f"{h_test_mean:.4f}", 'han_test_std': f"{h_test_std:.4f}",
+            'infer_rsage_ms': f"{mean_r*1000:.3f}", 'infer_rsage_std_ms': f"{std_r*1000:.3f}",
+            'infer_han_ms': f"{mean_h*1000:.3f}", 'infer_han_std_ms': f"{std_h*1000:.3f}",
+            'infer_student_ms': f"{mean_s*1000:.3f}", 'infer_student_std_ms': f"{std_s*1000:.3f}",
+        })
+        # 保证字段顺序稳定：先CLI参数，再结果
+        cli_keys = [k for k in vars(args).keys() if k not in fields_to_skip]
+        metric_keys = [k for k in row.keys() if k not in cli_keys]
+        fieldnames = cli_keys + metric_keys
+        need_header = not os.path.exists(args.log_csv)
+        with open(args.log_csv, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if need_header:
+                writer.writeheader()
+            writer.writerow(row)
 
 
 if __name__ == '__main__':
