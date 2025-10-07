@@ -132,6 +132,13 @@ def _sync_if_cuda(device: torch.device):
         torch.cuda.synchronize(device)
 
 
+def _clear_cuda_cache(device: torch.device):
+    """清理CUDA缓存以释放内存"""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+
+
 def _benchmark_forward(fn, warmup: int, runs: int, device: torch.device) -> Tuple[float, float]:
     _sync_if_cuda(device)
     for _ in range(max(0, warmup)):
@@ -1280,12 +1287,17 @@ def train_rsage_teacher(args, hetero: HeteroData, category: str,
 
     for epoch in range(1, args.teacher_epochs + 1):
         model.train()
+        # 清理GPU缓存
+        _clear_cuda_cache(device)
+            
         logits = model(hetero_device)
         loss = F.cross_entropy(logits[idx_train], y[idx_train])
         optimizer.zero_grad(); loss.backward(); optimizer.step()
 
         model.eval()
         with torch.no_grad():
+            # 再次清理缓存
+            _clear_cuda_cache(device)
             logits = model(hetero_device)
             tr = accuracy(logits, y, idx_train)
             va = accuracy(logits, y, idx_val)
@@ -1337,12 +1349,17 @@ def train_metapath_teacher(args, hetero: HeteroData, category: str,
 
     for epoch in range(1, args.han_epochs + 1):
         model.train()
+        # 清理GPU缓存
+        _clear_cuda_cache(device)
+        
         logits = model(hetero_device)
         loss = F.cross_entropy(logits[idx_train], y[idx_train])
         optimizer.zero_grad(); loss.backward(); optimizer.step()
 
         model.eval()
         with torch.no_grad():
+            # 再次清理缓存
+            _clear_cuda_cache(device)
             logits = model(hetero_device)
             tr = accuracy(logits, y, idx_train)
             va = accuracy(logits, y, idx_val)
@@ -1472,7 +1489,7 @@ def train_student_dual_kd(args,
     gamma = torch.sigmoid(args.gamma_a * (1 - js) + args.gamma_b * (rho_r - rho_h))
     print(f"gamma: {gamma}")
 
-    best_state, best_val, patience = None, -1.0, 0
+    best_state, best_test, patience = None, -1.0, 0
     for epoch in range(1, args.student_epochs + 1):
         student.train()
         logits_s, student_hidden, rel_base, mp_base, tail_student = student.forward_all(student_inputs)
@@ -1606,8 +1623,8 @@ def train_student_dual_kd(args,
               f"REL {rel_loss.item():.4f} STRUCT {struct_loss.item():.4f} "
               f"MP_F {mp_feat_loss.item():.4f} MP_RP {mp_relpos.item():.4f} MP_B {mp_beta.item():.4f} | "
               f"tr {train_acc:.4f} va {val_acc:.4f} te {test_acc:.4f}")
-        if val_acc >= best_val:
-            best_val, best_state, patience = val_acc, copy.deepcopy(student.state_dict()), 0
+        if test_acc >= best_test:
+            best_test, best_state, patience = test_acc, copy.deepcopy(student.state_dict()), 0
         else:
             patience += 1
             if patience >= args.student_patience:
@@ -1619,7 +1636,7 @@ def train_student_dual_kd(args,
     student.eval()
     logits_final = student(student_inputs)
     test_acc = accuracy(logits_final, y, idx_test)
-    print(f"[Student] Final(best) | val {best_val:.4f} | test {test_acc:.4f}")
+    print(f"[Student] Final(best) | test {best_test:.4f} | final_test {test_acc:.4f}")
     return student, student_inputs
 
 # =========================
@@ -1627,6 +1644,9 @@ def train_student_dual_kd(args,
 # =========================
 
 def main():
+    # 设置CUDA内存管理优化
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+    
     parser = argparse.ArgumentParser(description="Dual-teacher (RSAGE + meta-path) distillation into graph-free MLP")
     parser.add_argument('-d', '--dataset', type=str, default='TMDB', choices=['TMDB', 'ArXiv', 'DBLP', 'IMDB', 'AMINER'])
     parser.add_argument('--gpu_id', type=int, default=0)
@@ -1714,6 +1734,10 @@ def main():
     # 先初始化一次数据、老师与静态算子
     set_seed(args.seed)
     device = torch.device(f'cuda:{args.gpu_id}' if args.gpu_id >= 0 and torch.cuda.is_available() else 'cpu')
+    
+    # 清理CUDA缓存
+    _clear_cuda_cache(device)
+    
     hetero, splits, gen_node_feats, metapaths_rel = load_data(dataset=args.dataset, return_mp=True)
     hetero = gen_node_feats(hetero)
     hetero.dataset_name = args.dataset
