@@ -132,13 +132,6 @@ def _sync_if_cuda(device: torch.device):
         torch.cuda.synchronize(device)
 
 
-def _clear_cuda_cache(device: torch.device):
-    """清理CUDA缓存以释放内存"""
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(device)
-
-
 def _benchmark_forward(fn, warmup: int, runs: int, device: torch.device) -> Tuple[float, float]:
     _sync_if_cuda(device)
     for _ in range(max(0, warmup)):
@@ -405,17 +398,6 @@ class GraphFreeStudent(nn.Module):
         logits, *_ = self.forward_all(x)
         return logits
 
-    def structural_logits(self, rel_student: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]],
-                           category: str) -> Optional[torch.Tensor]:
-        collected = []
-        for et, tensors in rel_student.items():
-            if et[2] != category:
-                continue
-            collected.append(tensors['dst'])
-        if not collected:
-            return None
-        stacked = torch.stack(collected, dim=0).mean(dim=0)
-        return self.struct_classifier(stacked)
 
     def structural_logits_direct(self, rel_base: torch.Tensor, category: str) -> torch.Tensor:
         """直接使用MLP特征进行结构分类，不依赖关系嵌入字典"""
@@ -437,103 +419,6 @@ class GraphFreeStudent(nn.Module):
         return F.softmax(beta_logits, dim=1)
 
 
-class RelKDAdapter(nn.Module):
-    """Train-time relation adapter that mirrors the RSAGE taps."""
-
-    def __init__(self, node_dims: Dict[str, int], d_rel: int):
-        super().__init__()
-        self.d_rel = d_rel
-        proj = {}
-        for nt, dim in node_dims.items():
-            if dim == d_rel:
-                proj[nt] = nn.Identity()
-            else:
-                proj[nt] = nn.Linear(dim, d_rel, bias=False)
-        self.proj = nn.ModuleDict(proj)
-
-    @torch.no_grad()
-    def _build_adj(self, hetero: HeteroData, et: Tuple[str, str, str], device: torch.device):
-        s, _, d = et
-        edge_index = hetero[et].edge_index.to(device)
-        num_s = hetero[s].num_nodes
-        num_d = hetero[d].num_nodes
-        value = torch.ones(edge_index.size(1), device=device)
-        A = SparseTensor(row=edge_index[1], col=edge_index[0], value=value,
-                         sparse_sizes=(num_d, num_s)).coalesce()
-        deg = A.sum(dim=1).to_dense().clamp_min(1.0)
-        row, col, val = A.coo()
-        norm_val = val / deg[row]
-        A_norm = SparseTensor(row=row, col=col, value=norm_val,
-                              sparse_sizes=(num_d, num_s)).coalesce()
-        return A_norm, deg
-
-    def forward(self, hetero: HeteroData, etypes: List[Tuple[str, str, str]],
-                node_overrides: Optional[Dict[str, torch.Tensor]] = None,
-                device: Optional[torch.device] = None):
-        device = device or hetero[etypes[0][0]].x.device
-        x_proj = {}
-        for nt in hetero.node_types:
-            feats = node_overrides[nt] if node_overrides and nt in node_overrides else hetero[nt].x
-            proj = self.proj[nt]
-            x_proj[nt] = proj(feats.to(device)) if not isinstance(proj, nn.Identity) else feats.to(device)
-
-        rel_embs: Dict[Tuple[str, str, str], Dict[str, torch.Tensor]] = {}
-        for et in etypes:
-            s, _, d = et
-            A_norm, deg = self._build_adj(hetero, et, device)
-            dst = A_norm.matmul(x_proj[s])
-            rel_embs[et] = {
-                'dst': dst,
-                'src_in': x_proj[s],
-                'deg_dst': deg
-            }
-        return rel_embs
-
-
-class MetaPathAdapter(nn.Module):
-    def __init__(self, node_dims: Dict[str, int],
-                 metapaths: List[List[Tuple[str, str, str]]],
-                 d_mp: int,
-                 ops_template: Dict[str, Dict[str, List[SparseTensor]]]):
-        super().__init__()
-        self.proj = nn.ModuleDict()
-        self.metapath_keys = [metapath_to_str(mp) for mp in metapaths]
-        self.metapaths = {metapath_to_str(mp): mp for mp in metapaths}
-        self.ops_template = ops_template
-        self.d_mp = d_mp
-        for nt, dim in node_dims.items():
-            if dim == d_mp:
-                self.proj[nt] = nn.Identity()
-            else:
-                self.proj[nt] = nn.Linear(dim, d_mp, bias=False)
-
-    def forward(self, hetero: HeteroData,
-                node_overrides: Optional[Dict[str, torch.Tensor]] = None,
-                device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
-        if len(self.metapath_keys) == 0:
-            return {}
-        if device is None:
-            example_proj = next(iter(self.proj.values()))
-            if isinstance(example_proj, nn.Identity):
-                device = hetero[hetero.node_types[0]].x.device
-            else:
-                device = example_proj.weight.device
-        x_proj = {}
-        for nt in hetero.node_types:
-            feats = node_overrides[nt] if node_overrides and nt in node_overrides else hetero[nt].x
-            proj = self.proj[nt]
-            x_proj[nt] = proj(feats.to(device)) if not isinstance(proj, nn.Identity) else feats.to(device)
-
-        mp_embs: Dict[str, torch.Tensor] = {}
-        for key in self.metapath_keys:
-            mp = self.metapaths[key]
-            ops_info = self.ops_template[key]
-            z = x_proj[mp[0][0]]
-            for op in ops_info['norm_ops']:
-                op_dev = op.to(device)
-                z = op_dev.matmul(z)
-            mp_embs[key] = z
-        return mp_embs
  
 # =========================
 # Student meta-path embeddings (direct, no adapter)
@@ -917,7 +802,19 @@ class MetaPathTeacher(nn.Module):
     # Forward
     # ------------------------------------------------------------------
     def forward(self, hetero: HeteroData, feats_override: Optional[torch.Tensor] = None):
-        logits, *_ = self.forward_with_details(hetero, feats_override=feats_override)
+        # Lightweight path: NO semantic attention tensors during training
+        device = next(self.parameters()).device
+        meta_graph = self._clone_meta_graph(hetero, device, feats_override)
+
+        x_dict = {nt: meta_graph[nt].x for nt in meta_graph.node_types}
+        edge_index_dict = {et: meta_graph[et].edge_index for et in meta_graph.edge_types}
+
+        h_dict = self.han_conv1(x_dict, edge_index_dict)
+        h_dict = {nt: self.dropout(self.act(h)) for nt, h in h_dict.items()}
+
+        # IMPORTANT: do NOT ask for semantic attention weights here
+        out_dict = self.han_conv2(h_dict, edge_index_dict)
+        logits = self.lin(out_dict[self.category])
         return logits
 
     def forward_with_details(
@@ -955,6 +852,7 @@ class MetaPathTeacher(nn.Module):
 
     def project_student_delta(self, delta: torch.Tensor) -> torch.Tensor:
         return self.delta_projector_student(delta)
+
 
 # =========================
 # Loss componlp
@@ -1006,7 +904,6 @@ def relation_relative_pos_l2(
     relation_stats: Dict[Tuple[str, str, str], Dict[str, Union[int, float, torch.Tensor]]] = {}
     relation_mean_tensors: Dict[Tuple[str, str, str], torch.Tensor] = {}
 
-    # 仅对目标类别为 dst==category 且在两侧字典中均存在的边类型进行蒸馏，避免无关警告
     candidate_edge_types = [
         et for et in hetero.edge_types
         if (et in taps_teacher and et in rel_student and et[2] == category)
@@ -1031,14 +928,12 @@ def relation_relative_pos_l2(
         rel_s = _edge_relpos(emb_s_dst, emb_s_src, ei)
         l2 = (rel_t - rel_s).pow(2).sum(dim=-1) / rel_t.size(1)
 
-        # Optional per-edge reliability weighting
         if reliability is not None:
             l2 = l2 * reliability[ei[1].long()]
 
         rel_mean = l2.mean()
         losses.append(rel_mean)
 
-        # Relation-level weighting
         w = 1.0
         if relation_weights is not None and et in relation_weights:
             w = float(relation_weights[et])
@@ -1048,7 +943,6 @@ def relation_relative_pos_l2(
         total_weight += w
 
         if return_details:
-            # Collect stats for monitoring/debugging
             rel_std = (l2.std() if l2.numel() > 1 else torch.tensor(0.0, device=l2.device))
             relation_stats[et] = {
                 'mean_loss': float(rel_mean.detach().cpu().item()),
@@ -1058,7 +952,6 @@ def relation_relative_pos_l2(
                 'num_edges': int(l2.numel()),
                 'weight': float(w),
             }
-            # Keep gradient-carrying per-relation mean tensor for custom optimization
             relation_mean_tensors[et] = rel_mean
             if include_per_edge:
                 relation_stats[et]['per_edge_loss'] = l2.detach().cpu()
@@ -1177,6 +1070,7 @@ def meta_path_alignment_losses(
     reliability: torch.Tensor,
     metapath_keys: List[str],
     component_weights: Optional[Dict[str, float]] = None,
+    lambda_mp_total: Optional[float] = None,
     eps: float = 1e-8,
 ) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]:
     device = reliability.device
@@ -1274,14 +1168,46 @@ def meta_path_alignment_losses(
     attn_similarity = F.cosine_similarity(beta_teacher_aligned, beta_student_aligned, dim=1).mean()
 
     weights = component_weights or {}
-    feat_w = float(weights.get('feat', 0.0))
-    rel_w = float(weights.get('relpos', 0.0))
-    beta_w = float(weights.get('beta', 0.0))
+    feat_w_raw = float(weights.get('feat', 0.0))
+    rel_w_raw = float(weights.get('relpos', 0.0))
+    beta_w_raw = float(weights.get('beta', 0.0))
 
+    # Apply total scaling similar to relation distillation
+    if lambda_mp_total is not None:
+        scale_value = float(lambda_mp_total)
+    else:
+        scale_value = feat_w_raw + rel_w_raw + beta_w_raw
+
+    if scale_value <= 0.0:
+        zero = torch.tensor(0.0, device=device)
+        return {
+            'feature': feature_loss,
+            'relpos': relpos_loss,
+            'beta': beta_loss,
+            'total': zero,
+            'scaled': {'feature': zero, 'relpos': zero, 'beta': zero},
+            'raw': {'feature': feature_loss, 'relpos': relpos_loss, 'beta': beta_loss},
+            'weights': {'feat': zero, 'relpos': zero, 'beta': zero, 'scale': zero},
+            'details': {'active_keys': active_keys, 'attn_similarity': attn_similarity,
+                       'mean_gate': torch.stack(path_gate_means).mean(),
+                       'rel_align_mean': rel_align_mean.mean(),
+                       'feat_align_mean': feat_align_mean.mean()},
+        }
+
+    # Normalize weights
+    total_raw = feat_w_raw + rel_w_raw + beta_w_raw
+    if total_raw > 0.0:
+        feat_w = feat_w_raw / total_raw
+        rel_w = rel_w_raw / total_raw
+        beta_w = beta_w_raw / total_raw
+    else:
+        feat_w = rel_w = beta_w = 1.0 / 3.0
+
+    scale_tensor = torch.tensor(scale_value, device=device)
     scaled = {
-        'feature': feature_loss * feat_w,
-        'relpos': relpos_loss * rel_w,
-        'beta': beta_loss * beta_w,
+        'feature': feature_loss * feat_w * scale_tensor,
+        'relpos': relpos_loss * rel_w * scale_tensor,
+        'beta': beta_loss * beta_w * scale_tensor,
     }
     total = scaled['feature'] + scaled['relpos'] + scaled['beta']
 
@@ -1300,6 +1226,7 @@ def meta_path_alignment_losses(
             'feat': torch.tensor(feat_w, device=device),
             'relpos': torch.tensor(rel_w, device=device),
             'beta': torch.tensor(beta_w, device=device),
+            'scale': scale_tensor,
         },
         'details': {
             'active_keys': active_keys,
@@ -1355,7 +1282,7 @@ def metapath2vec_category_embeddings(hetero: HeteroData,
         cache_path = Path(cache_dir) / f"mp2v_{hash_key}.pt"
         if cache_path.exists():
             print(f"[MP2V] Loading cached MetaPath2Vec embeddings from {cache_path}")
-            cached = torch.load(cache_path, map_location=device)
+            cached = torch.load(cache_path, map_location=device, weights_only=False)
             print(f"[MP2V] Cached embeddings shape: {cached.shape}")
             return cached
     # 采用与 relation_distill_only.py 一致的老版逻辑：逐条元路径训练，使用 metapath= 参数
@@ -1447,8 +1374,9 @@ def load_teachers_if_available(base_dir: str, dataset: str, seed: int,
     if rsage_p.exists() and han_p.exists():
         print(f"[TeacherCache] Loading teachers from {root}")
         rsage, han = build_fn()
-        rsage.load_state_dict(torch.load(rsage_p, map_location=device))
-        han.load_state_dict(torch.load(han_p, map_location=device))
+        rsage.load_state_dict(torch.load(rsage_p, map_location=device, weights_only=False))
+        han.load_state_dict(torch.load(han_p, map_location=device, weights_only=False))
+        rsage.to(device); han.to(device)
         rsage.eval(); han.eval()
         return rsage, han, True
     return None, None, False
@@ -1479,18 +1407,12 @@ def train_rsage_teacher(args, hetero: HeteroData, category: str,
 
     for epoch in range(1, args.teacher_epochs + 1):
         model.train()
-        # 清理GPU缓存
-        _clear_cuda_cache(device)
-            
         logits = model(hetero_device)
         loss = F.cross_entropy(logits[idx_train], y[idx_train])
         optimizer.zero_grad(); loss.backward(); optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            # 再次清理缓存
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
             logits = model(hetero_device)
             tr = accuracy(logits, y, idx_train)
             va = accuracy(logits, y, idx_val)
@@ -1542,18 +1464,12 @@ def train_metapath_teacher(args, hetero: HeteroData, category: str,
 
     for epoch in range(1, args.han_epochs + 1):
         model.train()
-        # 清理GPU缓存
-        _clear_cuda_cache(device)
-        
         logits = model(hetero_device)
         loss = F.cross_entropy(logits[idx_train], y[idx_train])
         optimizer.zero_grad(); loss.backward(); optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            # 再次清理缓存
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
             logits = model(hetero_device)
             tr = accuracy(logits, y, idx_train)
             va = accuracy(logits, y, idx_val)
@@ -1624,13 +1540,6 @@ def train_student_dual_kd(args,
     use_direct_aux = not getattr(args, 'no_direct_aux', False)
     print(f"use_direct_aux: {use_direct_aux}")
 
-    # 取消RelKDAdapter，直接使用MLP特征进行关系蒸馏
-    # node_dims_rel = dict(node_dims)
-    # node_dims_rel[category] = student.rel_dim
-    # rel_adapter = RelKDAdapter(node_dims_rel, d_rel=student.rel_dim).to(device)
-
-    # 移除Adapter：改为直接用学生特征构造元路径表征
-
     teacher_delta_proj = nn.Linear(args.han_hidden, args.delta_dim, bias=False).to(device)
 
     hetero_device = hetero.to(device)
@@ -1693,48 +1602,32 @@ def train_student_dual_kd(args,
         kd_h = kd_kl(logits_s, logits_h, T=args.kd_T, reduce=False)
         kd_loss = ((gamma * rho_r * kd_rel) + ((1 - gamma) * rho_h * kd_h)).mean() * args.kd_coeff
  
-        #kd_loss = kd_kl(logits_s, logits_r, T=args.kd_T, reduce=True) 
-
-        # 修复梯度传递问题：确保辅助损失能够训练MLP学生模型
-        # 移除detach()调用，让所有损失都能向学生模型传递梯度
-        rel_base_aux = rel_base  # 保持梯度连接
-        mp_base_aux = mp_base    # 保持梯度连接
-        tail_student_aux = tail_student  # 保持梯度连接
-
-        # 直接使用MLP特征进行关系蒸馏，取消RelKDAdapter
-        # 创建简化的学生关系嵌入：为每个边类型创建正确的节点嵌入
+        rel_base_aux = rel_base
+        mp_base_aux = mp_base
+        tail_student_aux = tail_student
         rel_student = {}
         for et in hetero.edge_types:
             src, _, dst = et
-            if dst == category:  # 只处理目标节点是目标类别的边
-                # 为源节点和目标节点创建正确大小的嵌入
-                # 目标节点使用rel_base_aux（目标类别节点的嵌入）
-                # 源节点需要创建对应大小的嵌入
+            if dst == category:
                 src_num_nodes = hetero[src].num_nodes
                 dst_num_nodes = hetero[dst].num_nodes
                 
-                # 为目标节点创建嵌入（使用rel_base_aux）
                 dst_emb = rel_base_aux
                 
-                # 为源节点创建嵌入（需要扩展到源节点数量）
                 if src_num_nodes == dst_num_nodes:
-                    # 如果源节点和目标节点数量相同，直接使用rel_base_aux
                     src_emb = rel_base_aux
                 else:
-                    # 如果数量不同，需要扩展或截断rel_base_aux
                     if src_num_nodes > dst_num_nodes:
-                        # 源节点更多，需要扩展
                         padding_size = src_num_nodes - dst_num_nodes
                         padding = torch.zeros(padding_size, rel_base_aux.size(1), 
                                             device=rel_base_aux.device, dtype=rel_base_aux.dtype)
                         src_emb = torch.cat([rel_base_aux, padding], dim=0)
                     else:
-                        # 源节点更少，需要截断
                         src_emb = rel_base_aux[:src_num_nodes]
                 
                 rel_student[et] = {
-                    'dst': dst_emb,      # 目标节点嵌入
-                    'src_in': src_emb    # 源节点输入嵌入
+                    'dst': dst_emb,
+                    'src_in': src_emb
                 }
 
         taps_projected = {}
@@ -1804,6 +1697,7 @@ def train_student_dual_kd(args,
                 'relpos': args.lambda_mp_relpos,
                 'beta': args.lambda_mp_beta,
             },
+            lambda_mp_total=getattr(args, 'lambda_mp_total', None),
         )
 
         rel_loss = relation_losses['scaled']['relpos']
@@ -1851,9 +1745,6 @@ def train_student_dual_kd(args,
 # =========================
 
 def main():
-    # 设置CUDA内存管理优化
-    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-    
     parser = argparse.ArgumentParser(description="Dual-teacher (RSAGE + meta-path) distillation into graph-free MLP")
     parser.add_argument('-d', '--dataset', type=str, default='TMDB', choices=['TMDB', 'ArXiv', 'DBLP', 'IMDB', 'AMINER'])
     parser.add_argument('--gpu_id', type=int, default=0)
@@ -1897,8 +1788,8 @@ def main():
     parser.add_argument('--student_hidden', type=int, default=128)
     parser.add_argument('--student_layers', type=int, default=2)
     parser.add_argument('--student_dropout', type=float, default=0.5)
-    parser.add_argument('--student_lr', type=float, default=0.001)
-    parser.add_argument('--student_wd', type=float, default=0.0001)
+    parser.add_argument('--student_lr', type=float, default=0.003)
+    parser.add_argument('--student_wd', type=float, default=0)
     parser.add_argument('--student_epochs', type=int, default=1000)
     parser.add_argument('--student_patience', type=int, default=200)
     parser.add_argument('--no_direct_aux', action='store_true',
@@ -1910,13 +1801,15 @@ def main():
     parser.add_argument('--kd_coeff', type=float, default= 1)
     parser.add_argument('--lambda_rel_pos', type=float, default=1)
     parser.add_argument('--lambda_rel_struct', type=float, default=1)
-    parser.add_argument('--lambda_rel_total', type=float, default=1,
+    parser.add_argument('--lambda_rel_total', type=float, default=0.15,
                         help='Overall scaling for the combined relation loss (defaults to rel_pos + rel_struct).')
     parser.add_argument('--relation_balance', type=float, default=0.2,
                         help='Optional [0,1] ratio for the structural branch within the relation loss (1 => structure only).')
     parser.add_argument('--lambda_mp_feat', type=float, default=1)
     parser.add_argument('--lambda_mp_relpos', type=float, default=1)
-    parser.add_argument('--lambda_mp_beta', type=float, default=1)  # 大幅增加beta损失权重
+    parser.add_argument('--lambda_mp_beta', type=float, default=0)  
+    parser.add_argument('--lambda_mp_total', type=float, default=0.5,
+                        help='Overall scaling for the combined meta-path loss (defaults to feat + relpos + beta).')
     parser.add_argument('--rel_dim', type=int, default=128)
     parser.add_argument('--mp_dim', type=int, default=128)
     parser.add_argument('--mp_beta_hidden', type=int, default=128)
@@ -1945,10 +1838,6 @@ def main():
     # 先初始化一次数据、老师与静态算子
     set_seed(args.seed)
     device = torch.device(f'cuda:{args.gpu_id}' if args.gpu_id >= 0 and torch.cuda.is_available() else 'cpu')
-    
-    # 清理CUDA缓存
-    _clear_cuda_cache(device)
-    
     hetero, splits, gen_node_feats, metapaths_rel = load_data(dataset=args.dataset, return_mp=True)
     hetero = gen_node_feats(hetero)
     hetero.dataset_name = args.dataset
